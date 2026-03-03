@@ -124,6 +124,8 @@ async function resolveUserGatewayContext(req, res, { requireProvisioned = true }
 
 const allowedOrigins = [
     'https://openclaw-frontend.vercel.app',
+    'https://mission-control-frontend-kappa.vercel.app',
+    'https://mission-control-control-plane.vercel.app/',
     'https://automation-1.magicteams.ai',
     'http://127.0.0.1:4444',
     'http://localhost:4444',
