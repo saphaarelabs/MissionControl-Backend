@@ -1,0 +1,964 @@
+import express from 'express';
+import cors from 'cors';
+import { createClient } from '@supabase/supabase-js';
+import { verifyToken } from '@clerk/backend';
+import { createProxyMiddleware, fixRequestBody } from 'http-proxy-middleware';
+import WebSocket from 'ws';
+
+const app = express();
+const PORT = parseInt(process.env.PORT || '4000', 10);
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY;
+const CLERK_JWT_KEY = process.env.CLERK_JWT_KEY;
+
+const supabaseAdmin = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
+    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+        auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }
+    })
+    : null;
+
+function requireSupabaseAdmin(_req, res) {
+    if (supabaseAdmin) return supabaseAdmin;
+    if (!SUPABASE_URL) res.status(500).json({ error: 'SUPABASE_URL not set' });
+    else if (!SUPABASE_SERVICE_ROLE_KEY) res.status(500).json({ error: 'SUPABASE_SERVICE_ROLE_KEY not set' });
+    else res.status(500).json({ error: 'Supabase admin client not configured' });
+    return null;
+}
+
+function getBearerToken(req) {
+    const header = req.headers?.authorization || req.headers?.Authorization;
+    if (!header || typeof header !== 'string') return null;
+    const match = header.match(/^Bearer\s+(.+)$/i);
+    return match?.[1]?.trim() || null;
+}
+
+async function requireClerkUserId(req, res) {
+    const token = getBearerToken(req);
+    if (!token) {
+        console.warn(`[backend] AUTH 401 ${req.method} ${req.path} — no Bearer token`);
+        res.status(401).json({ error: 'Missing Authorization: Bearer <token>' });
+        return null;
+    }
+
+    if (!CLERK_JWT_KEY && !CLERK_SECRET_KEY) {
+        console.error('[backend] AUTH 500 — neither CLERK_JWT_KEY nor CLERK_SECRET_KEY is set');
+        res.status(500).json({ error: 'Set CLERK_JWT_KEY (recommended) or CLERK_SECRET_KEY to verify tokens' });
+        return null;
+    }
+
+    try {
+        const verified = await verifyToken(token, {
+            ...(CLERK_JWT_KEY ? { jwtKey: CLERK_JWT_KEY } : {}),
+            ...(CLERK_SECRET_KEY ? { secretKey: CLERK_SECRET_KEY } : {})
+        });
+        const userId = verified?.sub;
+        if (!userId) {
+            console.warn(`[backend] AUTH 401 ${req.method} ${req.path} — token missing sub`);
+            res.status(401).json({ error: 'Invalid token (missing sub claim)' });
+            return null;
+        }
+        return userId;
+    } catch (err) {
+        console.warn(`[backend] AUTH 401 ${req.method} ${req.path} — ${err.message}`);
+        res.status(401).json({ error: 'Invalid token' });
+        return null;
+    }
+}
+
+function normalizeGatewayBaseUrl(value) {
+    if (!value || typeof value !== 'string') return null;
+    try {
+        return new URL(value).origin;
+    } catch {
+        return null;
+    }
+}
+
+async function resolveUserGatewayContext(req, res, { requireProvisioned = true } = {}) {
+    const userId = await requireClerkUserId(req, res);
+    if (!userId) return null;
+
+    const sb = requireSupabaseAdmin(req, res);
+    if (!sb) return null;
+
+    const { data, error } = await sb
+        .from('user_profiles')
+        .select('operation_status, instance_url, gateway_token, local_websocket')
+        .eq('userid', userId)
+        .maybeSingle();
+
+    if (error) {
+        res.status(500).json({ error: error.message });
+        return null;
+    }
+
+    if (!data) {
+        res.status(404).json({ error: 'User profile not found' });
+        return null;
+    }
+
+    const baseUrl = normalizeGatewayBaseUrl(data.instance_url);
+    if (data.instance_url && !baseUrl) {
+        res.status(500).json({ error: 'Invalid instance_url on user profile' });
+        return null;
+    }
+
+    if (requireProvisioned && !baseUrl) {
+        res.status(409).json({
+            error: 'User instance is not provisioned yet',
+            operationStatus: data.operation_status || null
+        });
+        return null;
+    }
+
+    return {
+        userId,
+        profile: data,
+        baseUrl,
+        gatewayToken: data.gateway_token || null,
+        wsUrl: data.local_websocket || null
+    };
+}
+
+const allowedOrigins = [
+    'https://openclaw-frontend.vercel.app',
+    'https://automation-1.magicteams.ai',
+    'http://127.0.0.1:4444',
+    'http://localhost:4444',
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'https://openclaw-api.magicteams.ai',
+    'https://openclaw.ai',
+    'https://app.openclaw.ai'
+];
+
+const corsOptions = {
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+        return callback(new Error('Not allowed by CORS'));
+    },
+    credentials: true
+};
+app.use((req, res, next) => {
+    if (req.method === 'OPTIONS') return cors(corsOptions)(req, res, () => res.status(204).end());
+    next();
+});
+app.use(cors(corsOptions));
+app.use(express.json({ limit: '2mb' }));
+
+// ── Request logger ────────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+    const start = Date.now();
+    const hasAuth = Boolean(req.headers.authorization);
+    res.on('finish', () => {
+        const ms = Date.now() - start;
+        const status = res.statusCode;
+        const flag = status >= 500 ? '✗' : status >= 400 ? '!' : '✓';
+        console.log(`[backend] ${flag} ${req.method} ${req.path} → ${status} (${ms}ms)${hasAuth ? '' : ' [no-auth]'}`);
+    });
+    next();
+});
+
+// ── Health check ──────────────────────────────────────────────────────────────
+app.get('/api/health', async (req, res) => {
+    const gateway = await resolveUserGatewayContext(req, res, { requireProvisioned: false });
+    if (!gateway) return;
+
+    try {
+        const { baseUrl, gatewayToken, profile } = gateway;
+        if (!baseUrl) {
+            return res.status(200).json({
+                status: 'provisioning',
+                operationStatus: profile.operation_status || null,
+                message: 'User instance is not ready yet'
+            });
+        }
+
+        // Fast path: root HTML responds quickly if gateway is up.
+        try {
+            const rootRes = await fetch(`${baseUrl}/`, {
+                method: 'GET',
+                signal: AbortSignal.timeout(2000)
+            });
+            if (rootRes.ok) {
+                return res.json({ status: 'online', ts: new Date().toISOString() });
+            }
+        } catch {
+            // Fall through to deeper check
+        }
+
+        if (!gatewayToken) {
+            return res.status(200).json({ status: 'offline', message: 'Missing user gateway token' });
+        }
+
+        const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${gatewayToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                model: 'health-check',
+                messages: [{ role: 'user', content: 'ping' }],
+                max_tokens: 1
+            }),
+            signal: AbortSignal.timeout(10000)
+        });
+
+        if (!response.ok) {
+            const text = await response.text();
+            return res.status(200).json({
+                status: 'offline',
+                message: `Gateway error ${response.status}`,
+                details: text.slice(0, 200)
+            });
+        }
+
+        return res.json({ status: 'online', ts: new Date().toISOString() });
+    } catch (error) {
+        return res.status(200).json({ status: 'offline', message: error.message });
+    }
+});
+
+// ── User profile sync (upsert + trigger control plane provisioning) ────────────
+app.post('/api/user/profile/sync', async (req, res) => {
+    const userId = await requireClerkUserId(req, res);
+    if (!userId) return;
+
+    const { username } = req.body || {};
+    const normalizedUsername = typeof username === 'string' ? username.trim() : '';
+    if (!normalizedUsername) {
+        return res.status(400).json({ error: 'username is required' });
+    }
+
+    const sb = requireSupabaseAdmin(req, res);
+    if (!sb) return;
+
+    try {
+        const { data, error } = await sb
+            .from('user_profiles')
+            .upsert({ userid: userId, username: normalizedUsername }, { onConflict: 'userid' })
+            .select('*')
+            .single();
+
+        if (error) return res.status(500).json({ error: error.message });
+
+        console.log(`[profile/sync] userId=${userId} operation_status=${data.operation_status}`);
+
+        if (data.operation_status === 'onboarded') {
+            const controlPlaneUrl = process.env.OPENCLAW_CONTROL_PLANE_URL || 'http://localhost:4445';
+            console.log(`[profile/sync] triggering control-plane at ${controlPlaneUrl} for userId=${userId}`);
+            fetch(`${controlPlaneUrl}/api/provision/user`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Internal-Secret': process.env.OPENCLAW_INTERNAL_SECRET || ''
+                },
+                body: JSON.stringify({ userId, username: normalizedUsername }),
+            }).then(async (r) => {
+                const body = await r.text().catch(() => '');
+                console.log(`[profile/sync] control-plane responded ${r.status}: ${body.slice(0, 200)}`);
+            }).catch((err) => console.error('[profile/sync] control-plane fetch failed:', err.message));
+        }
+
+        return res.json({ profile: data });
+    } catch (error) {
+        return res.status(500).json({ error: error?.message || 'Failed to sync profile' });
+    }
+});
+
+// ── User profile get ──────────────────────────────────────────────────────────
+app.get('/api/user/profile', async (req, res) => {
+    const userId = await requireClerkUserId(req, res);
+    if (!userId) return;
+
+    const sb = requireSupabaseAdmin(req, res);
+    if (!sb) return;
+
+    try {
+        const { data, error } = await sb
+            .from('user_profiles')
+            .select('*')
+            .eq('userid', userId)
+            .maybeSingle();
+
+        if (error) return res.status(500).json({ error: error.message });
+        return res.json({ profile: data || null });
+    } catch (error) {
+        return res.status(500).json({ error: error?.message || 'Failed to fetch profile' });
+    }
+});
+
+// ── VPS-Agent helpers ─────────────────────────────────────────────────────────
+const INTERNAL_SECRET = process.env.OPENCLAW_INTERNAL_SECRET || '';
+const LOCAL_API_PORT = process.env.LOCAL_API_PORT || '4444';
+
+async function resolveVpsAgentContext(req, res) {
+    const userId = await requireClerkUserId(req, res);
+    if (!userId) return null;
+
+    const sb = requireSupabaseAdmin(req, res);
+    if (!sb) return null;
+
+    const { data: profile, error: profileErr } = await sb
+        .from('user_profiles')
+        .select('operation_status, instance_url, gateway_token, vps_node_id')
+        .eq('userid', userId)
+        .maybeSingle();
+
+    if (profileErr || !profile) {
+        res.status(profileErr ? 500 : 404).json({ error: profileErr?.message || 'Profile not found' });
+        return null;
+    }
+
+    if (!profile.vps_node_id) {
+        res.status(409).json({ error: 'User instance not provisioned' });
+        return null;
+    }
+
+    const { data: node, error: nodeErr } = await sb
+        .from('vps_nodes')
+        .select('ip_address')
+        .eq('id', profile.vps_node_id)
+        .maybeSingle();
+
+    if (nodeErr || !node) {
+        res.status(500).json({ error: nodeErr?.message || 'VPS node not found' });
+        return null;
+    }
+
+    return { userId, agentBaseUrl: `http://${node.ip_address}:${LOCAL_API_PORT}` };
+}
+
+async function callVpsAgent(agentBaseUrl, path, body) {
+    const res = await fetch(`${agentBaseUrl}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': INTERNAL_SECRET },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30_000)
+    });
+    const data = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, data };
+}
+
+// ── Gateway WebSocket helper (challenge-response auth + send command) ──────────
+function gatewayWsSend(wsUrl, token, message, timeoutMs = 15_000) {
+    return new Promise((resolve, reject) => {
+        const ws = new WebSocket(wsUrl);
+        const timer = setTimeout(() => { ws.close(); reject(new Error('WebSocket timeout')); }, timeoutMs);
+        let authenticated = false;
+        const connectId = crypto.randomUUID ? crypto.randomUUID() : `conn-${Date.now()}`;
+
+        ws.on('message', (raw) => {
+            let msg;
+            try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+            // Step 1: respond to auth challenge with "connect" req
+            if (msg.event === 'connect.challenge') {
+                ws.send(JSON.stringify({
+                    type: 'req',
+                    method: 'connect',
+                    id: connectId,
+                    params: {
+                        minProtocol: 3,
+                        maxProtocol: 3,
+                        client: { id: 'gateway-client', version: 'dev', platform: 'linux', mode: 'backend' },
+                        caps: [],
+                        auth: { token },
+                        role: 'operator',
+                        scopes: ['operator.admin']
+                    }
+                }));
+                return;
+            }
+
+            // Step 2: connect response = auth success, now send actual command
+            if (msg.id === connectId && !authenticated) {
+                authenticated = true;
+                ws.send(JSON.stringify(message));
+                return;
+            }
+
+            // Step 3: collect the response to our command
+            if (authenticated && msg.id === message.id) {
+                clearTimeout(timer);
+                ws.close();
+                resolve(msg);
+            }
+        });
+
+        ws.on('error', (err) => { clearTimeout(timer); reject(err); });
+        ws.on('close', () => clearTimeout(timer));
+    });
+}
+
+// ── GET /api/models/config — read directly from config file via vps-agent ──────
+app.get('/api/models/config', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+    try {
+        const r = await fetch(`${ctx.agentBaseUrl}/api/internal/model-config?instanceId=${encodeURIComponent(ctx.userId)}`, {
+            headers: { 'X-Internal-Secret': INTERNAL_SECRET },
+            signal: AbortSignal.timeout(5_000)
+        });
+        const data = await r.json();
+        if (!r.ok) return res.status(500).json(data);
+        console.log(`[backend] GET /models/config: primary=${data.primary}, models=${data.allowedModels}`);
+        res.json(data);
+    } catch (err) {
+        res.status(502).json({ error: err.message });
+    }
+});
+
+// ── GET /api/openclaw-config — read from config file via vps-agent ─────────────
+app.get('/api/openclaw-config', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+    try {
+        const r = await fetch(`${ctx.agentBaseUrl}/api/internal/openclaw-config?instanceId=${encodeURIComponent(ctx.userId)}`, {
+            headers: { 'X-Internal-Secret': INTERNAL_SECRET },
+            signal: AbortSignal.timeout(5_000)
+        });
+        const data = await r.json();
+        if (!r.ok) return res.status(500).json(data);
+        res.json(data);
+    } catch (err) {
+        res.status(502).json({ error: err.message });
+    }
+});
+
+// ── Provider configuration (bypasses read-only gateway REST API) ──────────────
+app.post('/api/providers/connect', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+
+    const { provider, token, expiresIn } = req.body || {};
+    if (!provider || !token) return res.status(400).json({ error: 'provider and token are required' });
+
+    const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/configure-provider', {
+        instanceId: ctx.userId, provider, token, ...(expiresIn ? { expiresIn } : {})
+    });
+    console.log(`[backend] vps-agent configure-provider → ${status}`, data);
+    if (!ok) return res.status(500).json({ error: data.error || 'Failed to configure provider', detail: data });
+    res.json({ success: true });
+});
+
+// ── Custom provider config ────────────────────────────────────────────────────
+app.post('/api/providers/custom', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+    const { key, label, baseUrl, api, authHeader, headers, models } = req.body || {};
+    if (!key || !baseUrl) return res.status(400).json({ error: 'key and baseUrl are required' });
+    const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/configure-custom-provider', {
+        instanceId: ctx.userId, key, label, baseUrl, api, authHeader, headers, models
+    });
+    console.log(`[backend] vps-agent configure-custom-provider → ${status}`, data);
+    if (!ok) return res.status(500).json({ error: data.error || 'Failed to save custom provider', detail: data });
+    res.json({ success: true });
+});
+
+// ── Model config save (primary model via CLI, allowedModels stored in profile) ─
+app.put('/api/models/config', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+
+    const { primary } = req.body || {};
+    if (!primary) return res.status(400).json({ error: 'primary model is required' });
+
+    const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/set-model', {
+        instanceId: ctx.userId, model: primary
+    });
+    console.log(`[backend] vps-agent set-model → ${status}`, data);
+    if (!ok) return res.status(500).json({ error: data.error || 'Failed to set model', detail: data });
+    res.json({ success: true });
+});
+
+// ── File-based endpoints via vps-agent ────────────────────────────────────────
+async function vpsAgentGet(req, res, agentPath) {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+    try {
+        const url = `${ctx.agentBaseUrl}${agentPath}?instanceId=${encodeURIComponent(ctx.userId)}`;
+        const r = await fetch(url, { headers: { 'X-Internal-Secret': INTERNAL_SECRET }, signal: AbortSignal.timeout(5_000) });
+        const data = await r.json();
+        if (!r.ok) return res.status(500).json(data);
+        res.json(data);
+    } catch (err) { res.status(502).json({ error: err.message }); }
+}
+
+async function vpsAgentPut(req, res, agentPath, extraQuery = '') {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+    try {
+        const url = `${ctx.agentBaseUrl}${agentPath}?instanceId=${encodeURIComponent(ctx.userId)}${extraQuery}`;
+        const r = await fetch(url, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': INTERNAL_SECRET },
+            body: JSON.stringify(req.body),
+            signal: AbortSignal.timeout(5_000)
+        });
+        const data = await r.json();
+        if (!r.ok) return res.status(500).json(data);
+        res.json(data);
+    } catch (err) { res.status(502).json({ error: err.message }); }
+}
+
+app.get('/api/soul', (req, res) => vpsAgentGet(req, res, '/api/internal/soul'));
+app.put('/api/soul', (req, res) => vpsAgentPut(req, res, '/api/internal/soul'));
+
+app.get('/api/workspace-list', (req, res) => vpsAgentGet(req, res, '/api/internal/workspace-list'));
+app.get('/api/workspace-file', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+    try {
+        const name = req.query.name || '';
+        const url = `${ctx.agentBaseUrl}/api/internal/workspace-file?instanceId=${encodeURIComponent(ctx.userId)}&name=${encodeURIComponent(name)}`;
+        const r = await fetch(url, { headers: { 'X-Internal-Secret': INTERNAL_SECRET }, signal: AbortSignal.timeout(5_000) });
+        const data = await r.json();
+        if (!r.ok) return res.status(500).json(data);
+        res.json(data);
+    } catch (err) { res.status(502).json({ error: err.message }); }
+});
+app.put('/api/workspace-file', async (req, res) => {
+    const name = req.query.name || '';
+    vpsAgentPut(req, res, '/api/internal/workspace-file', `&name=${encodeURIComponent(name)}`);
+});
+
+app.put('/api/openclaw-config', (req, res) => vpsAgentPut(req, res, '/api/internal/openclaw-config'));
+
+// ── Sub-agents (agents.list + sessions.list merged for full info) ─────────────
+app.get('/api/subagents', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+
+    try {
+        // Fetch agents and sessions in parallel
+        const [agentsRes, sessionsRes] = await Promise.all([
+            callVpsAgent(ctx.agentBaseUrl, '/api/internal/agents-list', { instanceId: ctx.userId }),
+            callVpsAgent(ctx.agentBaseUrl, '/api/internal/sessions-list', { instanceId: ctx.userId, limit: 200 })
+        ]);
+
+        const agents = agentsRes.ok && Array.isArray(agentsRes.data?.agents) ? agentsRes.data.agents : [];
+        const jobs = sessionsRes.ok && Array.isArray(sessionsRes.data?.jobs) ? sessionsRes.data.jobs : [];
+
+        // Build session lookup by agentId
+        const sessionMap = {};
+        for (const job of jobs) {
+            if (job.agentId) sessionMap[job.agentId] = job;
+        }
+
+        const subagents = agents
+            .filter(a => a.id !== 'main')
+            .map(a => {
+                const session = sessionMap[a.id] || {};
+                return {
+                    sessionKey: `agent:${a.id}:${a.id}`,
+                    id: a.id,
+                    label: a.name || a.id,
+                    model: session.model || '',
+                    updatedAt: session.metadata?.updatedAt || null,
+                    status: session.status || 'active'
+                };
+            });
+
+        return res.json({ subagents });
+    } catch { /* fall through */ }
+    res.json({ subagents: [] });
+});
+
+app.post('/api/subagents/spawn', async (req, res) => {
+    const gateway = await resolveUserGatewayContext(req, res, { requireProvisioned: true });
+    if (!gateway) return;
+    if (!gateway.gatewayToken) return res.status(403).json({ error: 'Missing gateway token' });
+
+    const { task, label, model, agentId } = req.body || {};
+    if (!task) return res.status(400).json({ error: 'task is required' });
+
+    const aid = agentId || 'main';
+    const message = {
+        type: 'req', id: `spawn-${Date.now()}`,
+        method: 'chat.send',
+        params: {
+            sessionKey: `agent:${aid}:${aid}`,
+            message: task,
+            idempotencyKey: `spawn-${Date.now()}-${Math.random().toString(36).slice(2)}`
+        }
+    };
+
+    // Try direct WebSocket first, fall back to vps-agent (docker exec)
+    if (gateway.wsUrl) {
+        try {
+            console.log(`[backend] spawn: trying WS ${gateway.wsUrl}`);
+            const result = await gatewayWsSend(gateway.wsUrl, gateway.gatewayToken, message);
+            console.log(`[backend] sub-agent spawned via WS:`, JSON.stringify(result).slice(0, 200));
+            return res.json(result);
+        } catch (err) {
+            console.warn(`[backend] spawn WS failed (${err.message}), falling back to vps-agent`);
+        }
+    }
+
+    // Fallback: vps-agent docker exec approach
+    try {
+        const ctx = await resolveVpsAgentContext(req, res);
+        if (!ctx) return;
+        const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/subagents-spawn', {
+            instanceId: ctx.userId, task, label, model, agentId
+        });
+        if (!ok) return res.status(status).json(data);
+        console.log(`[backend] sub-agent spawned via vps-agent:`, data);
+        res.json(data);
+    } catch (err) {
+        console.error('[backend] subagents/spawn fallback error:', err.message);
+        res.status(502).json({ error: err.message });
+    }
+});
+
+// ── Agents management (via vps-agent WebSocket) ──────────────────────────────
+app.get('/api/agents', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+
+    // ?action=models → return available models for the dropdown
+    if (req.query.action === 'models') {
+        try {
+            const { ok, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/models-list', {
+                instanceId: ctx.userId
+            });
+            if (ok) {
+                // Transform to [{ key, name }] format the frontend expects
+                // Key must include provider prefix (e.g. "azurev1/Kimi-K2.5") to match config
+                const models = Array.isArray(data?.models) ? data.models
+                    : Array.isArray(data) ? data : [];
+                const mapped = models.map(m => {
+                    const id = m.key || m.id || m.model || m.name;
+                    const provider = m.provider || '';
+                    const key = provider && !id.includes('/') ? `${provider}/${id}` : id;
+                    return { key, name: m.name || id, provider };
+                });
+                return res.json(mapped);
+            }
+        } catch { /* fall through */ }
+        return res.json([]);
+    }
+
+    // ?id=<agentId> → return single agent config from openclaw.json
+    if (req.query.id) {
+        try {
+            const { ok, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/agent-config', {
+                instanceId: ctx.userId, agentId: req.query.id
+            });
+            if (ok) return res.json(data);
+        } catch { /* fall through */ }
+        return res.json({ agentId: req.query.id });
+    }
+
+    // No params → list all agents
+    try {
+        const { ok, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/agents-list', {
+            instanceId: ctx.userId
+        });
+        if (ok) return res.json(data);
+    } catch { /* fall through */ }
+    res.json({ agents: [] });
+});
+
+app.patch('/api/agents', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+    const agentId = req.query.id || 'main';
+    const updates = req.body || {};
+
+    try {
+        const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/agent-config-update', {
+            instanceId: ctx.userId, agentId, updates
+        });
+        if (!ok) return res.status(status).json(data);
+        res.json(data);
+    } catch (err) {
+        console.error('[backend] agents update error:', err.message);
+        res.status(502).json({ error: err.message });
+    }
+});
+
+app.delete('/api/agents', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+    const agentId = req.query.id;
+    if (!agentId) return res.status(400).json({ error: 'id query param required' });
+
+    try {
+        const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/agents-delete', {
+            instanceId: ctx.userId, agentId
+        });
+        if (!ok) return res.status(status).json(data);
+        res.json(data);
+    } catch (err) {
+        res.status(502).json({ error: err.message });
+    }
+});
+
+// ── Channel management ────────────────────────────────────────────────────────
+
+app.post('/api/channels/add', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+    const { channel, token, slackBotToken, slackAppToken } = req.body || {};
+    if (!channel) return res.status(400).json({ error: 'channel is required' });
+    const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/channels-add', {
+        instanceId: ctx.userId, channel, token, slackBotToken, slackAppToken
+    });
+    console.log(`[backend] vps-agent channels-add → ${status}`, data);
+    if (!ok) return res.status(500).json({ error: data.error || 'Failed to add channel', detail: data });
+    res.json(data);
+});
+
+app.get('/api/channels/status', (req, res) => vpsAgentGet(req, res, '/api/internal/channels-status'));
+app.get('/api/channels/list', (req, res) => vpsAgentGet(req, res, '/api/internal/channels-list'));
+
+app.post('/api/channels/login', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+    const { channel, verbose } = req.body || {};
+    if (!channel) return res.status(400).json({ error: 'channel is required' });
+    const controller = new AbortController();
+    req.on('close', () => controller.abort());
+    try {
+        const agentRes = await fetch(`${ctx.agentBaseUrl}/api/internal/channels-login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': INTERNAL_SECRET },
+            body: JSON.stringify({ instanceId: ctx.userId, channel, verbose }),
+            signal: controller.signal,
+        });
+        if (!agentRes.ok) {
+            const errData = await agentRes.json().catch(() => ({}));
+            return res.status(agentRes.status).json({ error: errData.error || 'Login failed' });
+        }
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Transfer-Encoding', 'chunked');
+        for await (const chunk of agentRes.body) {
+            res.write(chunk);
+        }
+        res.end();
+    } catch (err) {
+        if (!res.headersSent) res.status(502).json({ error: err.message });
+        else res.end();
+    }
+});
+
+// ── Chat endpoint (calls AI provider directly; gateway uses WebSocket, not REST) ──
+app.all('/api/chat', async (req, res) => {
+    if (req.method === 'GET') {
+        const { action } = req.query;
+        const userId = await requireClerkUserId(req, res);
+        if (!userId) return;
+        if (action === 'sessions') return res.json({ sessions: [] });
+        if (action === 'history') return res.json({ messages: [] });
+        return res.json({});
+    }
+
+    if (req.method === 'POST') {
+        const ctx = await resolveVpsAgentContext(req, res);
+        if (!ctx) return;
+
+        const { message, stream } = req.body || {};
+        if (!message) return res.status(400).json({ error: 'message is required' });
+
+        try {
+            // Read openclaw.json to get provider config
+            const cfgRes = await fetch(
+                `${ctx.agentBaseUrl}/api/internal/openclaw-config?instanceId=${encodeURIComponent(ctx.userId)}`,
+                { headers: { 'X-Internal-Secret': INTERNAL_SECRET }, signal: AbortSignal.timeout(5_000) }
+            );
+            const cfgData = await cfgRes.json();
+            if (!cfgRes.ok || !cfgData.content) {
+                return res.status(502).json({ error: 'Failed to read instance config' });
+            }
+
+            const config = JSON.parse(cfgData.content);
+            const primaryModel = config.agents?.defaults?.model?.primary || '';
+            const slashIdx = primaryModel.indexOf('/');
+            const providerKey = slashIdx > 0 ? primaryModel.slice(0, slashIdx) : null;
+            const modelName = slashIdx > 0 ? primaryModel.slice(slashIdx + 1) : null;
+            if (!providerKey || !modelName) {
+                return res.status(400).json({ error: 'No model/provider configured. Go to Settings → Models to configure one.' });
+            }
+
+            const provider = config.models?.providers?.[providerKey];
+            if (!provider?.baseUrl) {
+                return res.status(400).json({ error: `Provider "${providerKey}" has no baseUrl configured.` });
+            }
+
+            const apiKey = provider.apiKey || null;
+            const headers = {
+                'Content-Type': 'application/json',
+                ...(provider.headers || {}),
+            };
+            if (apiKey) {
+                headers['Authorization'] = `Bearer ${apiKey}`;
+                if (!headers['api-key']) headers['api-key'] = apiKey;
+            }
+
+            const completionsUrl = `${provider.baseUrl.replace(/\/$/, '')}/chat/completions`;
+            console.log(`[backend] POST /api/chat → ${completionsUrl} (model: ${providerKey}/${modelName})`);
+
+            const upstream = await fetch(completionsUrl, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    model: modelName,
+                    messages: [{ role: 'user', content: message }],
+                    stream: false
+                }),
+                signal: AbortSignal.timeout(120_000)
+            });
+
+            if (!upstream.ok) {
+                const errText = await upstream.text().catch(() => '');
+                console.error(`[backend] POST /api/chat → provider ${upstream.status}: ${errText.slice(0, 300)}`);
+                return res.status(upstream.status).json({ error: errText || `Provider error ${upstream.status}` });
+            }
+
+            const data = await upstream.json();
+            res.json(data);
+        } catch (err) {
+            console.error('[backend] POST /api/chat error:', err.message);
+            if (!res.headersSent) res.status(502).json({ error: err.message });
+            else res.end();
+        }
+        return;
+    }
+
+    res.status(405).json({ error: 'Method Not Allowed' });
+});
+
+// ── Task listing (GET /api/tasks → sessions.list via vps-agent) ──────────────
+app.get('/api/tasks', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+
+    try {
+        const { ok, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/sessions-list', {
+            instanceId: ctx.userId,
+            ids: req.query.ids || undefined,
+            limit: parseInt(req.query.limit) || 100,
+            includeNarrative: req.query.includeNarrative === 'true',
+            includeLog: req.query.includeLog === 'true'
+        });
+        if (ok) return res.json(data);
+    } catch { /* fall through */ }
+    res.json({ jobs: [] });
+});
+
+// ── Task creation (POST /api/tasks → chat.send with unique session) ──────────
+app.post('/api/tasks', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+
+    const { message, agentId, priority, name } = req.body || {};
+    if (!message) return res.status(400).json({ error: 'message is required' });
+
+    const aid = agentId || 'main';
+    // Each task gets its own session so it doesn't go to Telegram/existing channels
+    const taskId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const sessionKey = `agent:${aid}:${taskId}`;
+
+    try {
+        const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/chat-send', {
+            instanceId: ctx.userId,
+            sessionKey,
+            message,
+            idempotencyKey: taskId
+        });
+        if (!ok) return res.status(status).json(data);
+        res.json(data);
+    } catch (err) {
+        console.error('[backend] task creation error:', err.message);
+        res.status(502).json({ error: err.message });
+    }
+});
+
+// ── Broadcast (POST /api/broadcast → chat.send to multiple agents) ───────────
+app.post('/api/broadcast', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+
+    const { message, agentIds } = req.body || {};
+    if (!message) return res.status(400).json({ error: 'message is required' });
+    const agents = Array.isArray(agentIds) && agentIds.length ? agentIds : ['main'];
+
+    const tasks = [];
+    for (const aid of agents) {
+        try {
+            const taskId = `bcast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            const { ok, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/chat-send', {
+                instanceId: ctx.userId,
+                sessionKey: `agent:${aid}:${taskId}`,
+                message,
+                idempotencyKey: taskId
+            });
+            tasks.push({ agentId: aid, ok, ...(data || {}) });
+        } catch (err) {
+            tasks.push({ agentId: aid, ok: false, error: err.message });
+        }
+    }
+
+    res.json({ tasks });
+});
+
+// ── Heartbeat stub ────────────────────────────────────────────────────────────
+app.post('/api/heartbeat', async (req, res) => {
+    const userId = await requireClerkUserId(req, res);
+    if (!userId) return;
+    res.json({ ok: true });
+});
+
+// ── Multi-Tenant Catch-All Proxy ──────────────────────────────────────────────
+const gatewayProxy = createProxyMiddleware({
+    router: (req) => req._gatewayTarget,
+    changeOrigin: true,
+    secure: false,
+    on: {
+        proxyReq: (proxyReq, req) => {
+            // Express app.use('/api', ...) strips the /api prefix from req.url,
+            // but the gateway expects paths under /api/. Re-add the prefix.
+            proxyReq.path = '/api' + proxyReq.path;
+            proxyReq.setHeader('Authorization', `Bearer ${req._gatewayToken}`);
+            proxyReq.setHeader('x-gateway-token', req._gatewayToken);
+            fixRequestBody(proxyReq, req);
+        },
+        error: (err, _req, res) => {
+            if (!res.headersSent) res.status(502).json({ error: 'Proxy error: ' + err.message });
+        }
+    }
+});
+
+app.use('/api', async (req, res, next) => {
+    if (req.method === 'OPTIONS') return next();
+    if (req.path === '/health' || req.path.startsWith('/user/profile')
+        || req.path === '/chat' || req.path === '/heartbeat'
+        || req.path.startsWith('/subagents') || req.path.startsWith('/agents')
+        || req.path.startsWith('/channels') || req.path.startsWith('/providers')
+        || req.path.startsWith('/models') || req.path.startsWith('/soul')
+        || req.path.startsWith('/workspace') || req.path.startsWith('/openclaw-config')
+        || req.path.startsWith('/tasks') || req.path === '/broadcast') {
+        return next();
+    }
+
+    const gateway = await resolveUserGatewayContext(req, res, { requireProvisioned: true });
+    if (!gateway) return;
+
+    if (!gateway.gatewayToken) {
+        return res.status(403).json({ error: 'User is provisioned but missing gateway token' });
+    }
+
+    console.log(`[backend → proxy] ${req.method} /api${req.path} → ${gateway.baseUrl} (user: ${gateway.userId})`);
+    req._gatewayTarget = gateway.baseUrl;
+    req._gatewayToken = gateway.gatewayToken;
+    return gatewayProxy(req, res, next);
+});
+
+app.listen(PORT, () => {
+    console.log(`[backend] Listening on port ${PORT}`);
+});

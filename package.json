@@ -1,0 +1,27 @@
+{
+  "name": "missioncontrol-backend",
+  "version": "1.0.0",
+  "description": "Stateless multi-tenant proxy. Authenticates every request with Clerk, resolves the user's dedicated OpenClaw Gateway URL and token from Supabase, then transparently proxies the request to their isolated container.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/saphaarelabs/MissionControl-Backend.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/saphaarelabs/MissionControl-Backend/issues"
+  },
+  "homepage": "https://github.com/saphaarelabs/MissionControl-Backend#readme",
+  "dependencies": {
+    "clerk": "^0.6.1",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "supabase": "^2.76.15",
+    "ws": "^8.19.0"
+  }
+}
