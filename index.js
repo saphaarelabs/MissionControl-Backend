@@ -647,7 +647,7 @@ app.post('/api/providers/oauth/start', async (req, res) => {
 });
 
 // OAuth callback handler - handles "broken redirect" manual URL processing
-app.post('/api/providers/oauth/callback-manual', authenticateUser, async (req, res) => {
+app.post('/api/providers/oauth/callback-manual', async (req, res) => {
     try {
         const { callbackUrl } = req.body;
         
