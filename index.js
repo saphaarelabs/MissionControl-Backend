@@ -124,31 +124,99 @@ async function resolveUserGatewayContext(req, res, { requireProvisioned = true }
 }
 
 const allowedOrigins = [
+    // Production deployments
     'https://openclaw-frontend.vercel.app',
     'https://mission-control-frontend-kappa.vercel.app',
-    'https://mission-control-control-plane.vercel.app/',
+    'https://mission-control-control-plane.vercel.app',
     'https://automation-1.magicteams.ai',
+    'https://openclaw-api.magicteams.ai',
+    'https://openclaw.ai',
+    'https://app.openclaw.ai',
+    
+    // Development
     'http://127.0.0.1:4444',
     'http://localhost:4444',
     'http://localhost:5173',
     'http://127.0.0.1:5173',
-    'https://openclaw-api.magicteams.ai',
-    'https://openclaw.ai',
-    'https://app.openclaw.ai'
+    
+    // Environment variable support
+    ...(process.env.FRONTEND_URL ? [process.env.FRONTEND_URL] : []),
+    ...(process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()) : [])
 ];
 
+// Simplified and more reliable CORS configuration
 const corsOptions = {
-    origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
-        return callback(new Error('Not allowed by CORS'));
+    origin: function (origin, callback) {
+        console.log(`[CORS] Request from origin: ${origin || 'unknown'}`);
+        
+        // Allow requests with no origin (mobile apps, Postman, etc.)
+        if (!origin) {
+            console.log('[CORS] ✓ Allowing request with no origin');
+            return callback(null, true);
+        }
+        
+        if (allowedOrigins.includes(origin)) {
+            console.log(`[CORS] ✓ Allowing origin: ${origin}`);
+            return callback(null, true);
+        }
+        
+        console.log(`[CORS] ✗ Blocking origin: ${origin}`);
+        console.log(`[CORS] Allowed origins:`, allowedOrigins);
+        return callback(null, false);
     },
-    credentials: true
+    credentials: true,
+    methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+    allowedHeaders: [
+        'Origin',
+        'X-Requested-With', 
+        'Content-Type', 
+        'Accept',
+        'Authorization',
+        'Cache-Control',
+        'X-HTTP-Method-Override'
+    ],
+    preflightContinue: false,
+    optionsSuccessStatus: 204
 };
+
+// Apply CORS middleware
+app.use(cors(corsOptions));
+
+// Add debugging middleware to check CORS headers
 app.use((req, res, next) => {
-    if (req.method === 'OPTIONS') return cors(corsOptions)(req, res, () => res.status(204).end());
+    const originalSend = res.send;
+    const originalJson = res.json;
+    const originalEnd = res.end;
+    
+    res.send = function(data) {
+        console.log(`[CORS-DEBUG] Response headers for ${req.method} ${req.path}:`, {
+            'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
+            'access-control-allow-credentials': res.getHeader('access-control-allow-credentials'),
+            'access-control-allow-methods': res.getHeader('access-control-allow-methods'),
+            'access-control-allow-headers': res.getHeader('access-control-allow-headers')
+        });
+        return originalSend.call(this, data);
+    };
+    
+    res.json = function(data) {
+        console.log(`[CORS-DEBUG] JSON Response headers for ${req.method} ${req.path}:`, {
+            'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
+            'access-control-allow-credentials': res.getHeader('access-control-allow-credentials')
+        });
+        return originalJson.call(this, data);
+    };
+    
+    res.end = function(data) {
+        console.log(`[CORS-DEBUG] End Response headers for ${req.method} ${req.path}:`, {
+            'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
+            'access-control-allow-credentials': res.getHeader('access-control-allow-credentials')
+        });
+        return originalEnd.call(this, data);
+    };
+    
     next();
 });
-app.use(cors(corsOptions));
+
 app.use(express.json({ limit: '2mb' }));
 
 // ── Request logger ────────────────────────────────────────────────────────────
@@ -162,6 +230,40 @@ app.use((req, res, next) => {
         console.log(`[backend] ${flag} ${req.method} ${req.path} → ${status} (${ms}ms)${hasAuth ? '' : ' [no-auth]'}`);
     });
     next();
+});
+
+// ── Root endpoint ─────────────────────────────────────────────────────────────
+app.get('/', (req, res) => {
+    res.json({
+        message: 'MissionControl Backend API',
+        timestamp: new Date().toISOString(),
+        cors: {
+            origin: req.headers.origin,
+            allowedOrigins: allowedOrigins
+        }
+    });
+});
+
+// ── CORS Test endpoint ────────────────────────────────────────────────────────
+app.get('/api/cors-test', (req, res) => {
+    console.log(`[CORS-TEST] Headers:`, {
+        origin: req.headers.origin,
+        'access-control-request-method': req.headers['access-control-request-method'],
+        'access-control-request-headers': req.headers['access-control-request-headers']
+    });
+    
+    res.json({
+        message: 'CORS test successful',
+        timestamp: new Date().toISOString(),
+        origin: req.headers.origin,
+        method: req.method,
+        headers: req.headers
+    });
+});
+
+app.options('/api/cors-test', (req, res) => {
+    console.log(`[CORS-TEST-OPTIONS] Preflight request from origin: ${req.headers.origin}`);
+    res.status(204).end();
 });
 
 // ── Health check ──────────────────────────────────────────────────────────────
@@ -223,6 +325,16 @@ app.get('/api/health', async (req, res) => {
     } catch (error) {
         return res.status(200).json({ status: 'offline', message: error.message });
     }
+});
+
+// ── CORS test endpoint ──────────────────────────────────────────────────────────
+app.get('/api/cors-test', (req, res) => {
+    res.json({
+        message: 'CORS is working!',
+        origin: req.headers.origin,
+        allowedOrigins,
+        timestamp: new Date().toISOString()
+    });
 });
 
 // ── User profile sync (upsert + trigger control plane provisioning) ────────────
@@ -1422,28 +1534,44 @@ const gatewayProxy = createProxyMiddleware({
 });
 
 app.use('/api', async (req, res, next) => {
-    if (req.method === 'OPTIONS') return next();
-    if (req.path === '/health' || req.path.startsWith('/user/profile')
-        || req.path === '/chat' || req.path === '/heartbeat'
-        || req.path.startsWith('/subagents') || req.path.startsWith('/agents')
-        || req.path.startsWith('/channels') || req.path.startsWith('/providers')
-        || req.path.startsWith('/models') || req.path.startsWith('/soul')
-        || req.path.startsWith('/workspace') || req.path.startsWith('/openclaw-config')
-        || req.path.startsWith('/tasks') || req.path === '/broadcast') {
-        return next();
-    }
+    // Apply CORS to all API routes explicitly
+    cors(corsOptions)(req, res, () => {
+        // Handle OPTIONS requests for preflight
+        if (req.method === 'OPTIONS') {
+            console.log(`[API-CORS] Preflight request for ${req.path} from origin: ${req.headers.origin}`);
+            return res.status(204).end();
+        }
+        
+        // Routes handled directly by this backend
+        if (req.path === '/health' || req.path.startsWith('/user/profile')
+            || req.path === '/chat' || req.path === '/heartbeat'
+            || req.path.startsWith('/subagents') || req.path.startsWith('/agents')
+            || req.path.startsWith('/channels') || req.path.startsWith('/providers')
+            || req.path.startsWith('/models') || req.path.startsWith('/soul')
+            || req.path.startsWith('/workspace') || req.path.startsWith('/openclaw-config')
+            || req.path.startsWith('/tasks') || req.path === '/broadcast'
+            || req.path === '/cors-test') {
+            console.log(`[API] Direct route: ${req.method} ${req.path}`);
+            return next();
+        }
 
-    const gateway = await resolveUserGatewayContext(req, res, { requireProvisioned: true });
-    if (!gateway) return;
+        // Continue to proxy middleware for other routes
+        resolveUserGatewayContext(req, res, { requireProvisioned: true }).then(gateway => {
+            if (!gateway) return;
 
-    if (!gateway.gatewayToken) {
-        return res.status(403).json({ error: 'User is provisioned but missing gateway token' });
-    }
+            if (!gateway.gatewayToken) {
+                return res.status(403).json({ error: 'User is provisioned but missing gateway token' });
+            }
 
-    console.log(`[backend → proxy] ${req.method} /api${req.path} → ${gateway.baseUrl} (user: ${gateway.userId})`);
-    req._gatewayTarget = gateway.baseUrl;
-    req._gatewayToken = gateway.gatewayToken;
-    return gatewayProxy(req, res, next);
+            console.log(`[backend → proxy] ${req.method} /api${req.path} → ${gateway.baseUrl} (user: ${gateway.userId})`);
+            req._gatewayTarget = gateway.baseUrl;
+            req._gatewayToken = gateway.gatewayToken;
+            return gatewayProxy(req, res, next);
+        }).catch(err => {
+            console.error('[API] Gateway resolution error:', err);
+            res.status(500).json({ error: 'Failed to resolve gateway context' });
+        });
+    });
 });
 
 // ── OAuth state cleanup ─────────────────────────────────────────────────────
