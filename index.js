@@ -4,6 +4,7 @@ import { createClient } from '@supabase/supabase-js';
 import { verifyToken } from '@clerk/backend';
 import { createProxyMiddleware, fixRequestBody } from 'http-proxy-middleware';
 import WebSocket from 'ws';
+import crypto from 'crypto';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '4000', 10);
@@ -459,6 +460,394 @@ app.post('/api/providers/custom', async (req, res) => {
     console.log(`[backend] vps-agent configure-custom-provider → ${status}`, data);
     if (!ok) return res.status(500).json({ error: data.error || 'Failed to save custom provider', detail: data });
     res.json({ success: true });
+});
+
+// ── OAuth provider authentication ─────────────────────────────────────────────
+const oauthStates = new Map(); // Store OAuth state temporarily (in production, use Redis)
+
+// OAuth provider configurations 
+const OAUTH_PROVIDERS = {
+    'openai-codex': {
+        type: 'oauth',
+        authUrl: 'https://chat.openai.com/oauth/authorize',
+        tokenUrl: 'https://api.openai.com/oauth/token', 
+        clientId: process.env.OPENAI_CODEX_CLIENT_ID,
+        scope: 'openai.codex'
+    },
+    'minimax-portal': {
+        type: 'plugin',
+        pluginId: 'minimax-portal-auth',
+        authUrl: 'https://api.minimax.io/oauth/authorize',
+        tokenUrl: 'https://api.minimax.io/oauth/token',
+        clientId: '78257093-7e40-4613-99e0-527b14b39113',
+        scope: 'group_id profile model.completion',
+        regions: {
+            global: { baseUrl: 'https://api.minimax.io', clientId: '78257093-7e40-4613-99e0-527b14b39113' },
+            china: { baseUrl: 'https://api.minimaxi.com', clientId: '78257093-7e40-4613-99e0-527b14b39113' }
+        }
+    },
+    'qwen-portal': {
+        type: 'plugin',
+        pluginId: 'qwen-portal-auth', 
+        authUrl: 'https://chat.qwen.ai/oauth/authorize',
+        tokenUrl: 'https://chat.qwen.ai/api/v1/oauth2/token',
+        clientId: 'f0304373b74a44d2b584a3fb70ca9e56',
+        scope: 'chat.read chat.write'
+    }
+};
+
+app.post('/api/providers/oauth/start', async (req, res) => {
+    const userId = await requireClerkUserId(req, res);
+    if (!userId) return;
+
+    const { provider, region = 'global' } = req.body || {};
+    if (!provider) return res.status(400).json({ error: 'provider is required' });
+
+    const providerConfig = OAUTH_PROVIDERS[provider];
+    if (!providerConfig) {
+        return res.status(400).json({ 
+            error: `OAuth configuration missing for provider: ${provider}`,
+            supportedProviders: Object.keys(OAUTH_PROVIDERS)
+        });
+    }
+
+    // Handle plugin-based OAuth differently
+    if (providerConfig.type === 'plugin') {
+        return res.status(400).json({
+            error: `${provider} uses plugin-based OAuth. Enable the plugin first: openclaw plugins enable ${providerConfig.pluginId}`,
+            authType: 'plugin',
+            pluginId: providerConfig.pluginId,
+            instructions: [
+                `1. Enable plugin: openclaw plugins enable ${providerConfig.pluginId}`,
+                `2. Restart OpenClaw gateway`,
+                `3. Login: openclaw models auth login --provider ${provider} --set-default`
+            ]
+        });
+    }
+
+    // Traditional OAuth flow (only openai-codex)
+    if (!providerConfig.clientId) {
+        return res.status(500).json({ 
+            error: `OAuth client ID not configured for ${provider}. Set OPENAI_CODEX_CLIENT_ID environment variable.` 
+        });
+    }
+
+    // Generate state and PKCE parameters
+    const state = crypto.randomBytes(32).toString('hex');
+    const codeVerifier = crypto.randomBytes(32).toString('base64url');
+    const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+
+    // Store state temporarily (expires in 10 minutes) with user token
+    const userToken = getBearerToken(req);
+    oauthStates.set(state, {
+        userId,
+        provider,
+        codeVerifier,
+        userToken,
+        createdAt: Date.now()
+    });
+
+    // Clean up expired states
+    setTimeout(() => oauthStates.delete(state), 10 * 60 * 1000);
+
+    const redirectUri = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/oauth/callback`;
+    const authUrl = new URL(providerConfig.authUrl);
+    
+    authUrl.searchParams.set('client_id', providerConfig.clientId);
+    authUrl.searchParams.set('redirect_uri', redirectUri);
+    authUrl.searchParams.set('response_type', 'code');
+    authUrl.searchParams.set('scope', providerConfig.scope);
+    authUrl.searchParams.set('state', state);
+    authUrl.searchParams.set('code_challenge', codeChallenge);
+    authUrl.searchParams.set('code_challenge_method', 'S256');
+
+    res.json({ authUrl: authUrl.toString(), state });
+});
+
+app.get('/api/providers/oauth/callback', async (req, res) => {
+    const { code, state, error, error_description } = req.query;
+
+    if (error) {
+        console.error(`[backend] OAuth error: ${error} - ${error_description}`);
+        return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/app/settings?oauth_error=${encodeURIComponent(error_description || error)}`);
+    }
+
+    if (!code || !state) {
+        return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/app/settings?oauth_error=${encodeURIComponent('Missing code or state parameter')}`);
+    }
+
+    const stateData = oauthStates.get(state);
+    if (!stateData) {
+        return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/app/settings?oauth_error=${encodeURIComponent('Invalid or expired state')}`);
+    }
+
+    // Clean up state
+    oauthStates.delete(state);
+
+    const { userId, provider, codeVerifier, userToken } = stateData;
+    const providerConfig = OAUTH_PROVIDERS[provider];
+
+    try {
+        // Exchange code for access token
+        const tokenResponse = await fetch(providerConfig.tokenUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Accept': 'application/json'
+            },
+            body: new URLSearchParams({
+                grant_type: 'authorization_code',
+                client_id: providerConfig.clientId,
+                code: code,
+                redirect_uri: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/oauth/callback`,
+                code_verifier: codeVerifier
+            })
+        });
+
+        if (!tokenResponse.ok) {
+            const errorData = await tokenResponse.text();
+            console.error(`[backend] Token exchange failed:`, errorData);
+            return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/app/settings?oauth_error=${encodeURIComponent('Token exchange failed')}`);
+        }
+
+        const tokenData = await tokenResponse.json();
+        const accessToken = tokenData.access_token;
+
+        if (!accessToken) {
+            return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/app/settings?oauth_error=${encodeURIComponent('No access token received')}`);
+        }
+
+        // Store token via VPS agent using the stored user token
+        const ctx = await resolveVpsAgentContext({ headers: { authorization: `Bearer ${userToken}` } }, null, userId);
+        if (!ctx) {
+            return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/app/settings?oauth_error=${encodeURIComponent('Failed to resolve user context')}`);
+        }
+
+        const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/configure-provider', {
+            instanceId: ctx.userId,
+            provider,
+            token: accessToken,
+            authMethod: 'oauth',
+            ...(tokenData.expires_in ? { expiresIn: tokenData.expires_in } : {})
+        });
+
+        if (!ok) {
+            console.error(`[backend] Failed to configure OAuth provider:`, data);
+            return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/app/settings?oauth_error=${encodeURIComponent('Failed to save OAuth token')}`);
+        }
+
+        // Redirect back to settings with success
+        res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/app/settings?oauth_success=${encodeURIComponent(provider)}`);
+
+    } catch (error) {
+        console.error(`[backend] OAuth callback error:`, error);
+        res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/app/settings?oauth_error=${encodeURIComponent('OAuth flow failed')}`);
+    }
+});
+
+// ── Plugin OAuth endpoints for device code flow ─────────────────────────────
+
+// Start plugin OAuth device code flow
+app.post('/api/providers/plugin-oauth/start', async (req, res) => {
+    const userId = await requireClerkUserId(req, res);
+    if (!userId) return;
+
+    const { provider, region = 'global' } = req.body || {};
+    if (!provider) return res.status(400).json({ error: 'provider is required' });
+
+    const providerConfig = OAUTH_PROVIDERS[provider];
+    if (!providerConfig || providerConfig.type !== 'plugin') {
+        return res.status(400).json({ error: `Plugin OAuth not supported for ${provider}` });
+    }
+
+    try {
+        let baseUrl, clientId;
+        
+        if (provider === 'minimax-portal') {
+            const regionConfig = providerConfig.regions[region] || providerConfig.regions.global;
+            baseUrl = regionConfig.baseUrl;
+            clientId = regionConfig.clientId;
+        } else {
+            baseUrl = providerConfig.authUrl.split('/oauth')[0];
+            clientId = providerConfig.clientId;
+        }
+
+        // Generate device authorization request
+        const deviceAuthUrl = `${baseUrl}/oauth/device`;
+        const deviceResponse = await fetch(deviceAuthUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                client_id: clientId,
+                scope: providerConfig.scope || '',
+                ...(provider === 'minimax-portal' ? { grant_type: 'urn:ietf:params:oauth:grant-type:user_code' } : {})
+            })
+        });
+
+        if (!deviceResponse.ok) {
+            throw new Error(`Device authorization failed: ${await deviceResponse.text()}`);
+        }
+
+        const deviceData = await deviceResponse.json();
+
+        // Store device info for polling
+        const deviceCode = deviceData.device_code;
+        oauthStates.set(deviceCode, {
+            userId,
+            provider,
+            region,
+            userCode: deviceData.user_code,
+            verificationUri: deviceData.verification_uri,
+            expiresIn: deviceData.expires_in || 600,
+            interval: deviceData.interval || 5,
+            createdAt: Date.now()
+        });
+
+        // Clean up after expiry
+        setTimeout(() => oauthStates.delete(deviceCode), (deviceData.expires_in || 600) * 1000);
+
+        res.json({
+            userCode: deviceData.user_code,
+            verificationUri: deviceData.verification_uri,
+            deviceCode,
+            expiresIn: deviceData.expires_in || 600,
+            interval: deviceData.interval || 5
+        });
+
+    } catch (error) {
+        console.error(`[backend] Plugin OAuth start error:`, error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Poll for plugin OAuth completion
+app.post('/api/providers/plugin-oauth/poll', async (req, res) => {
+    const userId = await requireClerkUserId(req, res);
+    if (!userId) return;
+
+    const { deviceCode } = req.body || {};
+    if (!deviceCode) return res.status(400).json({ error: 'deviceCode is required' });
+
+    const deviceInfo = oauthStates.get(deviceCode);
+    if (!deviceInfo || deviceInfo.userId !== userId) {
+        return res.status(400).json({ error: 'Invalid device code' });
+    }
+
+    const { provider, region } = deviceInfo;
+    const providerConfig = OAUTH_PROVIDERS[provider];
+
+    try {
+        let tokenUrl, clientId;
+        
+        if (provider === 'minimax-portal') {
+            const regionConfig = providerConfig.regions[region];
+            tokenUrl = `${regionConfig.baseUrl}/oauth/token`;
+            clientId = regionConfig.clientId;
+        } else {
+            tokenUrl = providerConfig.tokenUrl;
+            clientId = providerConfig.clientId;
+        }
+
+        const tokenResponse = await fetch(tokenUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                grant_type: provider === 'minimax-portal' ? 'urn:ietf:params:oauth:grant-type:user_code' : 'urn:ietf:params:oauth:grant-type:device_code',
+                device_code: deviceCode,
+                client_id: clientId
+            })
+        });
+
+        const tokenData = await tokenResponse.json();
+
+        if (!tokenResponse.ok) {
+            if (tokenData.error === 'authorization_pending') {
+                return res.json({ status: 'pending' });
+            }
+            if (tokenData.error === 'slow_down') {
+                return res.json({ status: 'slow_down' });
+            }
+            if (tokenData.error === 'expired_token') {
+                oauthStates.delete(deviceCode);
+                return res.status(400).json({ error: 'Device code expired' });
+            }
+            throw new Error(tokenData.error_description || tokenData.error);
+        }
+
+        // Success - clean up device code
+        oauthStates.delete(deviceCode);
+
+        // Store token via VPS agent
+        const ctx = await resolveVpsAgentContext(req, res, userId);
+        if (!ctx) {
+            return res.status(500).json({ error: 'Failed to resolve user context' });
+        }
+
+        const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/configure-provider', {
+            instanceId: ctx.userId,
+            provider,
+            token: tokenData.access_token,
+            authMethod: 'plugin-oauth',
+            ...(tokenData.expires_in ? { expiresIn: tokenData.expires_in } : {}),
+            ...(tokenData.refresh_token ? { refreshToken: tokenData.refresh_token } : {})
+        });
+
+        if (!ok) {
+            console.error(`[backend] Failed to configure plugin OAuth provider:`, data);
+            return res.status(500).json({ error: 'Failed to save OAuth token' });
+        }
+
+        res.json({ status: 'success', provider });
+
+    } catch (error) {
+        console.error(`[backend] Plugin OAuth poll error:`, error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ── Get provider catalog with OAuth support info ─────────────────────────────
+app.get('/api/providers/catalog', async (req, res) => {
+    const userId = await requireClerkUserId(req, res);
+    if (!userId) return;
+
+    const providers = [
+        { 
+            key: 'openai', 
+            label: 'OpenAI',
+            authMethods: ['api_key'],
+            description: 'Uses OPENAI_API_KEY'
+        },
+        { 
+            key: 'openai-codex', 
+            label: 'OpenAI Codex',
+            authMethods: ['oauth'],
+            authLabels: {
+                oauth: 'Login with ChatGPT'
+            },
+            description: 'OAuth via ChatGPT - only provider with true OAuth support'
+        },
+        { 
+            key: 'anthropic', 
+            label: 'Anthropic',
+            authMethods: ['api_key', 'setup_token'],
+            authLabels: {
+                api_key: 'API Key',
+                setup_token: 'Setup Token (claude setup-token)'
+            },
+            description: 'ANTHROPIC_API_KEY or claude setup-token (not OAuth)'
+        },
+        { key: 'gemini', label: 'Gemini', authMethods: ['api_key'], description: 'Uses GEMINI_API_KEY' },
+        { key: 'azurev1', label: 'Azure OpenAI', authMethods: ['api_key'], description: 'Uses AZURE_OPENAI_API_KEY' },
+        { key: 'openrouter', label: 'OpenRouter', authMethods: ['api_key'], description: 'Uses OPENROUTER_API_KEY' },
+        { key: 'venice', label: 'Venice AI', authMethods: ['api_key'], description: 'Uses VENICE_API_KEY' },
+        { key: 'bedrock', label: 'Amazon Bedrock', authMethods: ['api_key'], description: 'Uses AWS credentials' },
+        { key: 'nvidia', label: 'NVIDIA', authMethods: ['api_key'], description: 'Uses NVIDIA_API_KEY' },
+        { key: 'huggingface', label: 'Hugging Face', authMethods: ['api_key'], description: 'Uses HUGGINGFACE_HUB_TOKEN' },
+        { key: 'together', label: 'Together AI', authMethods: ['api_key'], description: 'Uses TOGETHER_API_KEY' },
+        { key: 'custom', label: '+ Custom Provider', authMethods: ['api_key'], description: 'Custom provider configuration' }
+    ];
+
+    res.json({ providers });
 });
 
 // ── Model config save (primary model via CLI, allowedModels stored in profile) ─
@@ -960,6 +1349,18 @@ app.use('/api', async (req, res, next) => {
     req._gatewayToken = gateway.gatewayToken;
     return gatewayProxy(req, res, next);
 });
+
+// ── OAuth state cleanup ─────────────────────────────────────────────────────
+// Clean up expired OAuth states periodically
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, state] of oauthStates.entries()) {
+        const expiredAt = state.createdAt + (state.expiresIn * 1000);
+        if (now > expiredAt) {
+            oauthStates.delete(key);
+        }
+    }
+}, 60000); // Clean up every minute
 
 app.listen(PORT, () => {
     console.log(`[backend] Listening on port ${PORT}`);
