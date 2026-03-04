@@ -1,5 +1,4 @@
 import express from 'express';
-import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 import { verifyToken } from '@clerk/backend';
 import { createProxyMiddleware, fixRequestBody } from 'http-proxy-middleware';
@@ -144,75 +143,36 @@ const allowedOrigins = [
     ...(process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()) : [])
 ];
 
-// Simplified and more reliable CORS configuration
-const corsOptions = {
-    origin: function (origin, callback) {
-        console.log(`[CORS] Request from origin: ${origin || 'unknown'}`);
-        
-        // Allow requests with no origin (mobile apps, Postman, etc.)
-        if (!origin) {
-            console.log('[CORS] ✓ Allowing request with no origin');
-            return callback(null, true);
-        }
-        
-        if (allowedOrigins.includes(origin)) {
-            console.log(`[CORS] ✓ Allowing origin: ${origin}`);
-            return callback(null, true);
-        }
-        
-        console.log(`[CORS] ✗ Blocking origin: ${origin}`);
-        console.log(`[CORS] Allowed origins:`, allowedOrigins);
-        return callback(null, false);
-    },
-    credentials: true,
-    methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
-    allowedHeaders: [
-        'Origin',
-        'X-Requested-With', 
-        'Content-Type', 
-        'Accept',
-        'Authorization',
-        'Cache-Control',
-        'X-HTTP-Method-Override'
-    ],
-    preflightContinue: false,
-    optionsSuccessStatus: 204
-};
+console.log('[CORS] Allowed origins:', allowedOrigins);
 
-// Apply CORS middleware
-app.use(cors(corsOptions));
-
-// Add debugging middleware to check CORS headers
+// Manual CORS middleware for maximum control and reliability
 app.use((req, res, next) => {
-    const originalSend = res.send;
-    const originalJson = res.json;
-    const originalEnd = res.end;
+    const origin = req.headers.origin;
     
-    res.send = function(data) {
-        console.log(`[CORS-DEBUG] Response headers for ${req.method} ${req.path}:`, {
-            'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
-            'access-control-allow-credentials': res.getHeader('access-control-allow-credentials'),
-            'access-control-allow-methods': res.getHeader('access-control-allow-methods'),
-            'access-control-allow-headers': res.getHeader('access-control-allow-headers')
-        });
-        return originalSend.call(this, data);
-    };
+    console.log(`[CORS] ${req.method} ${req.path} from origin: ${origin || 'none'}`);
     
-    res.json = function(data) {
-        console.log(`[CORS-DEBUG] JSON Response headers for ${req.method} ${req.path}:`, {
-            'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
-            'access-control-allow-credentials': res.getHeader('access-control-allow-credentials')
-        });
-        return originalJson.call(this, data);
-    };
+    // Check if origin is allowed
+    if (origin && allowedOrigins.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Vary', 'Origin');
+        console.log(`[CORS] ✓ Set CORS headers for: ${origin}`);
+    } else if (!origin) {
+        // Allow requests with no origin (curl, Postman, etc.)
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        console.log('[CORS] ✓ Allowing request with no origin');
+    } else {
+        console.log(`[CORS] ✗ Origin not allowed: ${origin}`);
+    }
     
-    res.end = function(data) {
-        console.log(`[CORS-DEBUG] End Response headers for ${req.method} ${req.path}:`, {
-            'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
-            'access-control-allow-credentials': res.getHeader('access-control-allow-credentials')
-        });
-        return originalEnd.call(this, data);
-    };
+    // Handle preflight OPTIONS requests
+    if (req.method === 'OPTIONS') {
+        console.log(`[CORS] Handling OPTIONS preflight for ${req.path}`);
+        res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, PUT, PATCH, POST, DELETE, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control, X-HTTP-Method-Override');
+        res.setHeader('Access-Control-Max-Age', '86400'); // 24 hours
+        return res.status(204).end();
+    }
     
     next();
 });
@@ -257,13 +217,11 @@ app.get('/api/cors-test', (req, res) => {
         timestamp: new Date().toISOString(),
         origin: req.headers.origin,
         method: req.method,
-        headers: req.headers
+        corsHeadersSet: {
+            'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
+            'access-control-allow-credentials': res.getHeader('access-control-allow-credentials')
+        }
     });
-});
-
-app.options('/api/cors-test', (req, res) => {
-    console.log(`[CORS-TEST-OPTIONS] Preflight request from origin: ${req.headers.origin}`);
-    res.status(204).end();
 });
 
 // ── Health check ──────────────────────────────────────────────────────────────
@@ -1534,44 +1492,31 @@ const gatewayProxy = createProxyMiddleware({
 });
 
 app.use('/api', async (req, res, next) => {
-    // Apply CORS to all API routes explicitly
-    cors(corsOptions)(req, res, () => {
-        // Handle OPTIONS requests for preflight
-        if (req.method === 'OPTIONS') {
-            console.log(`[API-CORS] Preflight request for ${req.path} from origin: ${req.headers.origin}`);
-            return res.status(204).end();
-        }
-        
-        // Routes handled directly by this backend
-        if (req.path === '/health' || req.path.startsWith('/user/profile')
-            || req.path === '/chat' || req.path === '/heartbeat'
-            || req.path.startsWith('/subagents') || req.path.startsWith('/agents')
-            || req.path.startsWith('/channels') || req.path.startsWith('/providers')
-            || req.path.startsWith('/models') || req.path.startsWith('/soul')
-            || req.path.startsWith('/workspace') || req.path.startsWith('/openclaw-config')
-            || req.path.startsWith('/tasks') || req.path === '/broadcast'
-            || req.path === '/cors-test') {
-            console.log(`[API] Direct route: ${req.method} ${req.path}`);
-            return next();
-        }
+    // Routes handled directly by this backend
+    if (req.path === '/health' || req.path.startsWith('/user/profile')
+        || req.path === '/chat' || req.path === '/heartbeat'
+        || req.path.startsWith('/subagents') || req.path.startsWith('/agents')
+        || req.path.startsWith('/channels') || req.path.startsWith('/providers')
+        || req.path.startsWith('/models') || req.path.startsWith('/soul')
+        || req.path.startsWith('/workspace') || req.path.startsWith('/openclaw-config')
+        || req.path.startsWith('/tasks') || req.path === '/broadcast'
+        || req.path === '/cors-test') {
+        console.log(`[API] Direct route: ${req.method} ${req.path}`);
+        return next();
+    }
 
-        // Continue to proxy middleware for other routes
-        resolveUserGatewayContext(req, res, { requireProvisioned: true }).then(gateway => {
-            if (!gateway) return;
+    // Continue to proxy middleware for other routes
+    const gateway = await resolveUserGatewayContext(req, res, { requireProvisioned: true });
+    if (!gateway) return;
 
-            if (!gateway.gatewayToken) {
-                return res.status(403).json({ error: 'User is provisioned but missing gateway token' });
-            }
+    if (!gateway.gatewayToken) {
+        return res.status(403).json({ error: 'User is provisioned but missing gateway token' });
+    }
 
-            console.log(`[backend → proxy] ${req.method} /api${req.path} → ${gateway.baseUrl} (user: ${gateway.userId})`);
-            req._gatewayTarget = gateway.baseUrl;
-            req._gatewayToken = gateway.gatewayToken;
-            return gatewayProxy(req, res, next);
-        }).catch(err => {
-            console.error('[API] Gateway resolution error:', err);
-            res.status(500).json({ error: 'Failed to resolve gateway context' });
-        });
-    });
+    console.log(`[backend → proxy] ${req.method} /api${req.path} → ${gateway.baseUrl} (user: ${gateway.userId})`);
+    req._gatewayTarget = gateway.baseUrl;
+    req._gatewayToken = gateway.gatewayToken;
+    return gatewayProxy(req, res, next);
 });
 
 // ── OAuth state cleanup ─────────────────────────────────────────────────────
