@@ -1,6 +1,7 @@
 {
   "name": "missioncontrol-backend",
   "version": "1.0.0",
+  "type": "module",
   "description": "Stateless multi-tenant proxy. Authenticates every request with Clerk, resolves the user's dedicated OpenClaw Gateway URL and token from Supabase, then transparently proxies the request to their isolated container.",
   "main": "index.js",
   "scripts": {
