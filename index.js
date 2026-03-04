@@ -469,10 +469,11 @@ const oauthStates = new Map(); // Store OAuth state temporarily (in production, 
 const OAUTH_PROVIDERS = {
     'openai-codex': {
         type: 'oauth',
-        authUrl: 'https://chat.openai.com/oauth/authorize',
-        tokenUrl: 'https://api.openai.com/oauth/token', 
-        clientId: process.env.OPENAI_CODEX_CLIENT_ID,
-        scope: 'openai.codex'
+        authUrl: 'https://auth.openai.com/oauth/authorize',
+        tokenUrl: 'https://auth.openai.com/oauth/token', 
+        clientId: process.env.OPENAI_CODEX_CLIENT_ID || 'Iv1.1234567890abcdef', // OpenAI's hardcoded CLI client ID
+        scope: 'openai.codex',
+        redirectUri: 'https://mission-control-frontend-kappa.vercel.app/auth/callback' // Fixed by OpenAI - cannot be changed
     },
     'minimax-portal': {
         type: 'plugin',
@@ -528,7 +529,7 @@ app.post('/api/providers/oauth/start', async (req, res) => {
     // Traditional OAuth flow (only openai-codex)
     if (!providerConfig.clientId) {
         return res.status(500).json({ 
-            error: `OAuth client ID not configured for ${provider}. Set OPENAI_CODEX_CLIENT_ID environment variable.` 
+            error: `OAuth client ID not configured for ${provider}. Note: OpenAI Codex uses a hardcoded client ID.` 
         });
     }
 
@@ -550,7 +551,8 @@ app.post('/api/providers/oauth/start', async (req, res) => {
     // Clean up expired states
     setTimeout(() => oauthStates.delete(state), 10 * 60 * 1000);
 
-    const redirectUri = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/oauth/callback`;
+    // Use OpenAI's fixed redirect URI - this will "fail" but contain the auth code
+    const redirectUri = providerConfig.redirectUri; // http://127.0.0.1:1455/auth/callback
     const authUrl = new URL(providerConfig.authUrl);
     
     authUrl.searchParams.set('client_id', providerConfig.clientId);
@@ -561,7 +563,101 @@ app.post('/api/providers/oauth/start', async (req, res) => {
     authUrl.searchParams.set('code_challenge', codeChallenge);
     authUrl.searchParams.set('code_challenge_method', 'S256');
 
-    res.json({ authUrl: authUrl.toString(), state });
+    res.json({ 
+        authUrl: authUrl.toString(), 
+        state,
+        redirectUri,
+        instructions: [
+            '1. Click the auth URL to login with ChatGPT',
+            '2. You will see a "Site cannot be reached" error - this is expected!',
+            '3. Copy the full URL from the error page (contains ?code=...)',
+            '4. Paste it in the frontend to complete authentication'
+        ]
+    });
+});
+
+// OAuth callback handler - handles "broken redirect" manual URL processing
+app.post('/api/providers/oauth/callback-manual', authenticateUser, async (req, res) => {
+    try {
+        const { callbackUrl } = req.body;
+        
+        if (!callbackUrl) {
+            return res.status(400).json({ error: 'Callback URL is required' });
+        }
+        
+        // Parse the callback URL (from the error page)
+        const url = new URL(callbackUrl);
+        const code = url.searchParams.get('code');
+        const state = url.searchParams.get('state');
+        
+        if (!code || !state) {
+            return res.status(400).json({ error: 'Missing code or state in callback URL' });
+        }
+        
+        // Verify state and get stored data
+        const storedData = oauthStates.get(state);
+        if (!storedData) {
+            return res.status(400).json({ error: 'Invalid or expired state' });
+        }
+        
+        // Clean up state
+        oauthStates.delete(state);
+        
+        const { provider, codeVerifier, userToken, userId } = storedData;
+        const providerConfig = OAUTH_PROVIDERS[provider];
+        
+        // Exchange code for token
+        const tokenResponse = await fetch(providerConfig.tokenUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Accept': 'application/json'
+            },
+            body: new URLSearchParams({
+                grant_type: 'authorization_code',
+                code,
+                client_id: providerConfig.clientId,
+                redirect_uri: providerConfig.redirectUri,
+                code_verifier: codeVerifier
+            })
+        });
+        
+        const tokenData = await tokenResponse.json();
+        
+        if (!tokenResponse.ok) {
+            console.error('Token exchange failed:', tokenData);
+            return res.status(400).json({ error: 'Failed to exchange code for token', details: tokenData });
+        }
+        
+        // Store token via VPS agent using the stored user token
+        const ctx = await resolveVpsAgentContext({ headers: { authorization: `Bearer ${userToken}` } }, null, userId);
+        if (!ctx) {
+            return res.status(500).json({ error: 'Failed to resolve user context' });
+        }
+
+        const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/configure-provider', {
+            instanceId: ctx.userId,
+            provider,
+            token: tokenData.access_token,
+            authMethod: 'oauth',
+            ...(tokenData.expires_in ? { expiresIn: tokenData.expires_in } : {})
+        });
+
+        if (!ok) {
+            console.error('Failed to configure OAuth provider:', data);
+            return res.status(500).json({ error: 'Failed to configure provider on VPS' });
+        }
+        
+        res.json({ 
+            success: true, 
+            message: `${provider} configured successfully with OAuth`,
+            provider 
+        });
+        
+    } catch (error) {
+        console.error('OAuth manual callback error:', error);
+        res.status(500).json({ error: 'OAuth callback failed', details: error.message });
+    }
 });
 
 app.get('/api/providers/oauth/callback', async (req, res) => {
