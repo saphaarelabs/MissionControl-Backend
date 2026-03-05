@@ -320,20 +320,28 @@ app.post('/api/user/profile/sync', async (req, res) => {
 
         console.log(`[profile/sync] userId=${userId} operation_status=${data.operation_status}`);
 
-        if (data.operation_status === 'onboarded') {
-            const controlPlaneUrl = process.env.OPENCLAW_CONTROL_PLANE_URL || 'http://localhost:4445';
-            console.log(`[profile/sync] triggering control-plane at ${controlPlaneUrl} for userId=${userId}`);
-            fetch(`${controlPlaneUrl}/api/provision/user`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Internal-Secret': process.env.OPENCLAW_INTERNAL_SECRET || ''
-                },
-                body: JSON.stringify({ userId, username: normalizedUsername }),
-            }).then(async (r) => {
-                const body = await r.text().catch(() => '');
-                console.log(`[profile/sync] control-plane responded ${r.status}: ${body.slice(0, 200)}`);
-            }).catch((err) => console.error('[profile/sync] control-plane fetch failed:', err.message));
+        // auto-provision if onboarded AND not already provisioning
+        if (data.operation_status === 'onboarded' && !data.provisioning_lock_id) {
+            // Try to acquire provisioning lock to prevent duplicate requests
+            const { data: lockResult } = await sb.rpc('acquire_provisioning_lock', { user_id: userId });
+            
+            if (lockResult) {
+                console.log(`[profile/sync] ✓ acquired lock for ${userId}, triggering provision...`);
+                const controlPlaneUrl = process.env.OPENCLAW_CONTROL_PLANE_URL || 'http://localhost:4445';
+                fetch(`${controlPlaneUrl}/api/provision/user`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Internal-Secret': process.env.OPENCLAW_INTERNAL_SECRET || ''
+                    },
+                    body: JSON.stringify({ userId, username: normalizedUsername }),
+                }).then(async (r) => {
+                    const body = await r.text().catch(() => '');
+                    console.log(`[profile/sync] control-plane responded ${r.status}: ${body.slice(0, 200)}`);
+                }).catch((err) => console.error('[profile/sync] control-plane fetch failed:', err.message));
+            } else {
+                console.log(`[profile/sync] ⏭ provisioning already in progress for ${userId}, skipping duplicate`);
+            }
         }
 
         return res.json({ profile: data });
