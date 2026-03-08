@@ -493,6 +493,98 @@ app.get('/api/models/config', async (req, res) => {
     }
 });
 
+// ── GET /api/models/catalog — list available models for a provider ───────────
+app.get('/api/models/catalog', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+
+    const { provider } = req.query;
+    if (!provider) return res.status(400).json({ error: 'provider query parameter required' });
+    
+    try {
+        // Call VPS agent to get models list from the OpenClaw gateway
+        const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/models-list', {
+            instanceId: ctx.userId
+        });
+        
+        if (!ok) {
+            console.error(`[backend] models-list failed: ${status}`, data);
+            return res.status(500).json({ error: data.error || 'Failed to fetch models', detail: data });
+        }
+        
+        // Filter models by provider if specified
+        const allModels = data.models || [];
+        const filteredModels = provider 
+            ? allModels.filter(m => {
+                const modelId = m.id || m;
+                return typeof modelId === 'string' && modelId.startsWith(`${provider}/`);
+            })
+            : allModels;
+        
+        // Transform to simple format if needed
+        const models = filteredModels.map(m => {
+            if (typeof m === 'string') {
+                const parts = m.split('/');
+                return { id: parts[1] || m, name: parts[1] || m };
+            }
+            // If model has provider prefix, strip it for display
+            const modelId = m.id || '';
+            const parts = modelId.split('/');
+            return {
+                id: parts[1] || modelId,
+                name: m.name || parts[1] || modelId
+            };
+        });
+        
+        res.json({ models });
+    } catch (err) {
+        console.error(`[backend] models/catalog error:`, err.message);
+        res.status(502).json({ error: err.message });
+    }
+});
+
+// ── GET /api/models/catalog-all — list all models from all providers ─────────
+app.get('/api/models/catalog-all', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+    
+    try {
+        // Call VPS agent to get complete models list from the OpenClaw gateway
+        const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/models-list', {
+            instanceId: ctx.userId
+        });
+        
+        if (!ok) {
+            console.error(`[backend] models-list failed: ${status}`, data);
+            return res.status(500).json({ error: data.error || 'Failed to fetch models', detail: data });
+        }
+        
+        const allModels = data.models || [];
+        
+        // Transform to include provider in response
+        const models = allModels.map(m => {
+            if (typeof m === 'string') {
+                const parts = m.split('/');
+                return {
+                    id: m,
+                    name: parts[1] || m,
+                    provider: parts[0] || 'unknown'
+                };
+            }
+            return {
+                id: m.id || '',
+                name: m.name || m.id || '',
+                provider: m.provider || (m.id || '').split('/')[0] || 'unknown'
+            };
+        });
+        
+        res.json({ models });
+    } catch (err) {
+        console.error(`[backend] models/catalog-all error:`, err.message);
+        res.status(502).json({ error: err.message });
+    }
+});
+
 // ── GET /api/openclaw-config — read from config file via vps-agent ─────────────
 app.get('/api/openclaw-config', async (req, res) => {
     const ctx = await resolveVpsAgentContext(req, res);
