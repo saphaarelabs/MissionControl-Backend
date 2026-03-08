@@ -607,11 +607,15 @@ app.post('/api/providers/connect', async (req, res) => {
     const ctx = await resolveVpsAgentContext(req, res);
     if (!ctx) return;
 
-    const { provider, token, expiresIn } = req.body || {};
+    const { provider, token, authMethod, expiresIn } = req.body || {};
     if (!provider || !token) return res.status(400).json({ error: 'provider and token are required' });
 
     const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/configure-provider', {
-        instanceId: ctx.userId, provider, token, ...(expiresIn ? { expiresIn } : {})
+        instanceId: ctx.userId, 
+        provider, 
+        token, 
+        authMethod: authMethod || 'api_key',
+        ...(expiresIn ? { expiresIn } : {})
     });
     console.log(`[backend] vps-agent configure-provider → ${status}`, data);
     if (!ok) return res.status(500).json({ error: data.error || 'Failed to configure provider', detail: data });
