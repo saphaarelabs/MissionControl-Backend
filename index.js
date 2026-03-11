@@ -300,7 +300,14 @@ app.post('/api/user/profile/sync', async (req, res) => {
     const userId = await requireClerkUserId(req, res);
     if (!userId) return;
 
-    const { username } = req.body || {};
+    const { 
+        username, 
+        fullName, 
+        phoneNumber, 
+        onboardingData,
+        triggerProvision 
+    } = req.body || {};
+    
     const normalizedUsername = typeof username === 'string' ? username.trim() : '';
     if (!normalizedUsername) {
         return res.status(400).json({ error: 'username is required' });
@@ -310,31 +317,52 @@ app.post('/api/user/profile/sync', async (req, res) => {
     if (!sb) return;
 
     try {
+        // Build upsert object with new fields
+        const upsertData = {
+            userid: userId,
+            username: normalizedUsername,
+        };
+        
+        // Add optional onboarding fields if provided
+        if (fullName) upsertData.full_name = fullName;
+        if (phoneNumber) upsertData.phone_number = phoneNumber;
+        if (onboardingData) upsertData.onboarding_data = onboardingData;
+
         const { data, error } = await sb
             .from('user_profiles')
-            .upsert({ userid: userId, username: normalizedUsername }, { onConflict: 'userid' })
+            .upsert(upsertData, { onConflict: 'userid' })
             .select('*')
             .single();
 
         if (error) return res.status(500).json({ error: error.message });
 
-        console.log(`[profile/sync] userId=${userId} operation_status=${data.operation_status}`);
+        console.log(`[profile/sync] userId=${userId} operation_status=${data.operation_status} onboarding_data=${!!data.onboarding_data}`);
 
         // auto-provision if onboarded AND not already provisioning
-        if (data.operation_status === 'onboarded' && !data.provisioning_lock_id) {
+        // OR if explicitly triggered via triggerProvision flag
+        const shouldProvision = (data.operation_status === 'onboarded' || triggerProvision) 
+                                && !data.provisioning_lock_id;
+        
+        if (shouldProvision) {
             // Try to acquire provisioning lock to prevent duplicate requests
             const { data: lockResult } = await sb.rpc('acquire_provisioning_lock', { user_id: userId });
             
             if (lockResult) {
                 console.log(`[profile/sync] ✓ acquired lock for ${userId}, triggering provision...`);
                 const controlPlaneUrl = process.env.OPENCLAW_CONTROL_PLANE_URL || 'http://localhost:4445';
+                
+                // Pass onboarding data to control plane for LLM configuration
                 fetch(`${controlPlaneUrl}/api/provision/user`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                         'X-Internal-Secret': process.env.OPENCLAW_INTERNAL_SECRET || ''
                     },
-                    body: JSON.stringify({ userId, username: normalizedUsername }),
+                    body: JSON.stringify({ 
+                        userId, 
+                        username: normalizedUsername,
+                        onboardingData: data.onboarding_data  // Pass along for LLM config
+                    }),
                 }).then(async (r) => {
                     const body = await r.text().catch(() => '');
                     console.log(`[profile/sync] control-plane responded ${r.status}: ${body.slice(0, 200)}`);
