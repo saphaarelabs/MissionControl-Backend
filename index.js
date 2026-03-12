@@ -1272,6 +1272,20 @@ app.get('/api/subagents', async (req, res) => {
     res.json({ subagents: [] });
 });
 
+// Debug endpoint to verify deployment version
+app.get('/api/subagents/version', (req, res) => {
+    res.json({
+        version: '2.0.0-subagent-spawn-fix',
+        timestamp: new Date().toISOString(),
+        commit: 'ec65745+',
+        features: {
+            wsAgentsCreate: true,
+            detailedLogging: true,
+            structuredResponse: true
+        }
+    });
+});
+
 app.post('/api/subagents/spawn', async (req, res) => {
     const gateway = await resolveUserGatewayContext(req, res, { requireProvisioned: true });
     if (!gateway) return;
@@ -1328,6 +1342,7 @@ app.post('/api/subagents/spawn', async (req, res) => {
             
             return res.json({
                 ok: true,
+                version: '2.0-subagent-fix',
                 agent: { id: aid, name: label || aid },
                 chat: chatResult?.payload || chatResult
             });
