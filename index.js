@@ -15,6 +15,10 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY;
 const CLERK_JWT_KEY = process.env.CLERK_JWT_KEY;
 
+// Directory where instance data is stored on the VPS (used when constructing paths).
+// Prefer environment override in hosting environments; default matches vps-agent's default.
+const INSTANCES_DIR = process.env.INSTANCES_DIR || '/var/lib/openclaw/instances';
+
 const supabaseAdmin = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
     ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
         auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }
