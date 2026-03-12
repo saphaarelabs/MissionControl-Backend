@@ -5,6 +5,7 @@ import { verifyToken } from '@clerk/backend';
 import { createProxyMiddleware, fixRequestBody } from 'http-proxy-middleware';
 import WebSocket from 'ws';
 import crypto from 'crypto';
+import path from 'path';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '4000', 10);
