@@ -453,13 +453,41 @@ async function resolveVpsAgentContext(req, res) {
     return { userId, agentBaseUrl: `http://${node.ip_address}:${LOCAL_API_PORT}` };
 }
 
-async function callVpsAgent(agentBaseUrl, path, body) {
-    const res = await fetch(`${agentBaseUrl}${path}`, {
-        method: 'POST',
+async function callVpsAgent(agentBaseUrl, path, body, method = 'POST') {
+    const options = {
+        method,
         headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': INTERNAL_SECRET },
-        body: JSON.stringify(body),
         signal: AbortSignal.timeout(30_000)
-    });
+    };
+    
+    let url = `${agentBaseUrl}${path}`;
+    
+    if (method === 'GET') {
+        // For GET requests, append query parameters from body
+        if (body && typeof body === 'object') {
+            const params = new URLSearchParams();
+            for (const [key, value] of Object.entries(body)) {
+                params.append(key, String(value));
+            }
+            if (params.toString()) {
+                url += (path.includes('?') ? '&' : '?') + params.toString();
+            }
+        }
+    } else if (method === 'PUT' && body && body.instanceId) {
+        // For PUT requests to VPS agent, instanceId goes in query params, content in body
+        const params = new URLSearchParams();
+        params.append('instanceId', body.instanceId);
+        url += (path.includes('?') ? '&' : '?') + params.toString();
+        
+        // Keep only content in the body for PUT requests
+        const putBody = { content: body.content };
+        options.body = JSON.stringify(putBody);
+    } else if (body) {
+        // For other POST requests, include full body as JSON
+        options.body = JSON.stringify(body);
+    }
+    
+    const res = await fetch(url, options);
     const data = await res.json().catch(() => ({}));
     return { ok: res.ok, status: res.status, data };
 }
