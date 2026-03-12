@@ -1810,6 +1810,12 @@ setInterval(() => {
     }
 }, 60000); // Clean up every minute
 
-app.listen(PORT, () => {
-    console.log(`[backend] Listening on port ${PORT}`);
-});
+// For local development
+if (process.env.NODE_ENV !== 'production') {
+    app.listen(PORT, () => {
+        console.log(`[backend] Listening on port ${PORT}`);
+    });
+}
+
+// Export for Vercel serverless deployment
+export default app;
