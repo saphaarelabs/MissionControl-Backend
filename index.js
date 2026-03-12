@@ -197,7 +197,13 @@ app.use((req, res, next) => {
 app.get('/', (req, res) => {
     res.json({
         message: 'MissionControl Backend API',
+        version: '2.0.0-subagent-fix',
+        buildTime: '2026-03-12T10:30:00Z',
         timestamp: new Date().toISOString(),
+        features: {
+            subagentSpawnFixed: true,
+            detailedLogging: true
+        },
         cors: {
             origin: req.headers.origin,
             allowedOrigins: allowedOrigins
