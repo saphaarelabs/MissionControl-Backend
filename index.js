@@ -1160,15 +1160,63 @@ app.put('/api/models/config', async (req, res) => {
     const ctx = await resolveVpsAgentContext(req, res);
     if (!ctx) return;
 
-    const { primary } = req.body || {};
+    const { primary, fallbacks = [], allowedModels = [] } = req.body || {};
     if (!primary) return res.status(400).json({ error: 'primary model is required' });
 
-    const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/set-model', {
-        instanceId: ctx.userId, model: primary
-    });
-    console.log(`[backend] vps-agent set-model → ${status}`, data);
-    if (!ok) return res.status(500).json({ error: data.error || 'Failed to set model', detail: data });
-    res.json({ success: true });
+    // Ensure primary is in allowedModels
+    const allAllowed = [...new Set([primary, ...fallbacks, ...allowedModels])];
+
+    // Read current config first to preserve other settings
+    const configPath = path.join(INSTANCES_DIR, ctx.userId, 'openclaw.json');
+    let config;
+    try {
+        const { ok: readOk, data: readData } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/openclaw-config', {
+            instanceId: ctx.userId
+        }, 'GET');
+        if (!readOk) throw new Error('Failed to read config');
+        config = JSON.parse(readData.content || '{}');
+    } catch (err) {
+        console.error('[backend] Failed to read openclaw.json:', err.message);
+        config = {};
+    }
+
+    // Update model configuration
+    config.agents = config.agents || {};
+    config.agents.defaults = config.agents.defaults || {};
+    config.agents.defaults.model = {
+        primary,
+        fallbacks
+    };
+
+    // Update allowed models - convert array to object format
+    config.agents.defaults.models = {};
+    for (const modelKey of allAllowed) {
+        config.agents.defaults.models[modelKey] = { enabled: true };
+    }
+
+    // Write back via VPS agent
+    const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/openclaw-config', {
+        instanceId: ctx.userId,
+        content: JSON.stringify(config, null, 2)
+    }, 'PUT');
+
+    console.log(`[backend] vps-agent openclaw-config update → ${status}`, data);
+    if (!ok) return res.status(500).json({ error: data.error || 'Failed to update config', detail: data });
+
+    // Also call config.apply via WebSocket to reload in running agent
+    try {
+        await callVpsAgent(ctx.agentBaseUrl, '/api/internal/agent-config-update', {
+            instanceId: ctx.userId,
+            agentId: 'main',
+            updates: {
+                model: { primary, fallbacks }
+            }
+        });
+    } catch (err) {
+        console.log('[backend] config.apply notification failed (non-fatal):', err.message);
+    }
+
+    res.json({ success: true, primary, fallbacks, allowedModels: allAllowed });
 });
 
 // ── File-based endpoints via vps-agent ────────────────────────────────────────
