@@ -1230,8 +1230,13 @@ app.get('/api/subagents', async (req, res) => {
             callVpsAgent(ctx.agentBaseUrl, '/api/internal/sessions-list', { instanceId: ctx.userId, limit: 200 })
         ]);
 
+        console.log(`[backend] /api/subagents - agentsRes.ok=${agentsRes.ok}, agents count=${agentsRes.data?.agents?.length || 0}`);
+        console.log(`[backend] /api/subagents - agents:`, JSON.stringify(agentsRes.data?.agents || []).slice(0, 500));
+
         const agents = agentsRes.ok && Array.isArray(agentsRes.data?.agents) ? agentsRes.data.agents : [];
         const jobs = sessionsRes.ok && Array.isArray(sessionsRes.data?.jobs) ? sessionsRes.data.jobs : [];
+
+        console.log(`[backend] /api/subagents - total agents: ${agents.length}, filtering out 'main'`);
 
         // Build session lookup by agentId
         const sessionMap = {};
@@ -1253,8 +1258,11 @@ app.get('/api/subagents', async (req, res) => {
                 };
             });
 
+        console.log(`[backend] /api/subagents - returning ${subagents.length} subagents`);
         return res.json({ subagents });
-    } catch { /* fall through */ }
+    } catch (err) {
+        console.error(`[backend] /api/subagents error:`, err);
+    }
     res.json({ subagents: [] });
 });
 
