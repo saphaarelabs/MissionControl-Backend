@@ -1269,10 +1269,12 @@ app.post('/api/subagents/spawn', async (req, res) => {
     // Generate agent ID from label or timestamp
     const aid = agentId || (label || 'sub-' + Date.now()).toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 30);
 
+    console.log(`[backend] spawn subagent: wsUrl=${gateway.wsUrl ? 'YES' : 'NO'}, aid=${aid}, label=${label}`);
+
     // Try direct WebSocket first, fall back to vps-agent (docker exec)
     if (gateway.wsUrl) {
         try {
-            console.log(`[backend] spawn: trying WS ${gateway.wsUrl}`);
+            console.log(`[backend] spawn: trying WS ${gateway.wsUrl}, creating agent ${aid}`);
             
             // Step 1: Create the agent
             const createMessage = {
@@ -1285,10 +1287,12 @@ app.post('/api/subagents/spawn', async (req, res) => {
                 }
             };
             
+            console.log(`[backend] sending agents.create for ${aid}...`);
             const createResult = await gatewayWsSend(gateway.wsUrl, gateway.gatewayToken, createMessage);
-            console.log(`[backend] agent created ${aid}:`, JSON.stringify(createResult).slice(0, 200));
+            console.log(`[backend] agents.create result:`, JSON.stringify(createResult).slice(0, 300));
             
             if (!createResult.ok && createResult.error) {
+                console.error(`[backend] agents.create failed:`, createResult.error);
                 return res.status(400).json({ error: createResult.error?.message || 'Failed to create agent' });
             }
 
@@ -1304,8 +1308,9 @@ app.post('/api/subagents/spawn', async (req, res) => {
                 }
             };
             
+            console.log(`[backend] sending chat.send to agent:${aid}:${aid}...`);
             const chatResult = await gatewayWsSend(gateway.wsUrl, gateway.gatewayToken, chatMessage);
-            console.log(`[backend] chat.send to ${aid}:`, JSON.stringify(chatResult).slice(0, 200));
+            console.log(`[backend] chat.send result:`, JSON.stringify(chatResult).slice(0, 300));
             
             return res.json({
                 ok: true,
@@ -1313,8 +1318,11 @@ app.post('/api/subagents/spawn', async (req, res) => {
                 chat: chatResult?.payload || chatResult
             });
         } catch (err) {
+            console.error(`[backend] spawn WS error:`, err);
             console.warn(`[backend] spawn WS failed (${err.message}), falling back to vps-agent`);
         }
+    } else {
+        console.log(`[backend] No wsUrl, using vps-agent fallback directly`);
     }
 
     // Fallback: vps-agent docker exec approach
