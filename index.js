@@ -1266,24 +1266,52 @@ app.post('/api/subagents/spawn', async (req, res) => {
     const { task, label, model, agentId } = req.body || {};
     if (!task) return res.status(400).json({ error: 'task is required' });
 
-    const aid = agentId || 'main';
-    const message = {
-        type: 'req', id: `spawn-${Date.now()}`,
-        method: 'chat.send',
-        params: {
-            sessionKey: `agent:${aid}:${aid}`,
-            message: task,
-            idempotencyKey: `spawn-${Date.now()}-${Math.random().toString(36).slice(2)}`
-        }
-    };
+    // Generate agent ID from label or timestamp
+    const aid = agentId || (label || 'sub-' + Date.now()).toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 30);
 
     // Try direct WebSocket first, fall back to vps-agent (docker exec)
     if (gateway.wsUrl) {
         try {
             console.log(`[backend] spawn: trying WS ${gateway.wsUrl}`);
-            const result = await gatewayWsSend(gateway.wsUrl, gateway.gatewayToken, message);
-            console.log(`[backend] sub-agent spawned via WS:`, JSON.stringify(result).slice(0, 200));
-            return res.json(result);
+            
+            // Step 1: Create the agent
+            const createMessage = {
+                type: 'req', 
+                id: `create-${Date.now()}`,
+                method: 'agents.create',
+                params: {
+                    name: aid,
+                    workspace: `/home/node/.openclaw/agents/${aid}`
+                }
+            };
+            
+            const createResult = await gatewayWsSend(gateway.wsUrl, gateway.gatewayToken, createMessage);
+            console.log(`[backend] agent created ${aid}:`, JSON.stringify(createResult).slice(0, 200));
+            
+            if (!createResult.ok && createResult.error) {
+                return res.status(400).json({ error: createResult.error?.message || 'Failed to create agent' });
+            }
+
+            // Step 2: Send the initial task message
+            const chatMessage = {
+                type: 'req', 
+                id: `spawn-${Date.now()}`,
+                method: 'chat.send',
+                params: {
+                    sessionKey: `agent:${aid}:${aid}`,
+                    message: task,
+                    idempotencyKey: `spawn-${Date.now()}-${Math.random().toString(36).slice(2)}`
+                }
+            };
+            
+            const chatResult = await gatewayWsSend(gateway.wsUrl, gateway.gatewayToken, chatMessage);
+            console.log(`[backend] chat.send to ${aid}:`, JSON.stringify(chatResult).slice(0, 200));
+            
+            return res.json({
+                ok: true,
+                agent: { id: aid, name: label || aid },
+                chat: chatResult?.payload || chatResult
+            });
         } catch (err) {
             console.warn(`[backend] spawn WS failed (${err.message}), falling back to vps-agent`);
         }
