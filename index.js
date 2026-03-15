@@ -121,6 +121,19 @@ function resolveConfiguredProviderForModel(config, modelKey) {
     return null;
 }
 
+function normalizeProviderRequestModel(provider, modelName) {
+    const normalizedBaseUrl = String(provider?.baseUrl || '').toLowerCase();
+    const trimmedModel = String(modelName || '').trim();
+    if (!trimmedModel) return trimmedModel;
+
+    // Cloudflare AI Gateway compat expects Workers AI models to be prefixed with workers-ai/.
+    if (normalizedBaseUrl.includes('gateway.ai.cloudflare.com') && trimmedModel.startsWith('@cf/')) {
+        return `workers-ai/${trimmedModel}`;
+    }
+
+    return trimmedModel;
+}
+
 async function resolveUserGatewayContext(req, res, { requireProvisioned = true } = {}) {
     const userId = await requireClerkUserId(req, res);
     if (!userId) return null;
@@ -1686,13 +1699,14 @@ app.all('/api/chat', async (req, res) => {
             }
 
             const completionsUrl = `${provider.baseUrl.replace(/\/$/, '')}/chat/completions`;
-            console.log(`[backend] POST /api/chat → ${completionsUrl} (model: ${resolved.resolvedProviderKey}/${resolved.modelName})`);
+            const requestModel = normalizeProviderRequestModel(provider, resolved.modelName);
+            console.log(`[backend] POST /api/chat → ${completionsUrl} (model: ${resolved.resolvedProviderKey}/${requestModel})`);
 
             const upstream = await fetch(completionsUrl, {
                 method: 'POST',
                 headers,
                 body: JSON.stringify({
-                    model: resolved.modelName,
+                    model: requestModel,
                     messages: [{ role: 'user', content: message }],
                     stream: false
                 }),
