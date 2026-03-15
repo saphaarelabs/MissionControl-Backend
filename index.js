@@ -82,6 +82,45 @@ function normalizeGatewayBaseUrl(value) {
     }
 }
 
+function resolveConfiguredProviderForModel(config, modelKey) {
+    const normalizedModelKey = String(modelKey || '').trim();
+    if (!normalizedModelKey) return null;
+
+    const slashIdx = normalizedModelKey.indexOf('/');
+    const requestedProviderKey = slashIdx > 0 ? normalizedModelKey.slice(0, slashIdx) : null;
+    const modelName = slashIdx > 0 ? normalizedModelKey.slice(slashIdx + 1) : normalizedModelKey;
+    const configuredProviders = config?.models?.providers || {};
+
+    if (requestedProviderKey && configuredProviders[requestedProviderKey]) {
+        return {
+            requestedProviderKey,
+            resolvedProviderKey: requestedProviderKey,
+            provider: configuredProviders[requestedProviderKey],
+            modelName,
+        };
+    }
+
+    for (const [resolvedProviderKey, provider] of Object.entries(configuredProviders)) {
+        const models = Array.isArray(provider?.models) ? provider.models : [];
+        const exact = models.find((entry) => {
+            const id = typeof entry === 'string' ? entry : entry?.id;
+            return String(id || '').trim() === normalizedModelKey;
+        });
+        if (exact) {
+            const exactId = typeof exact === 'string' ? exact : exact?.id;
+            const exactSlashIdx = String(exactId).indexOf('/');
+            return {
+                requestedProviderKey,
+                resolvedProviderKey,
+                provider,
+                modelName: exactSlashIdx > 0 ? String(exactId).slice(exactSlashIdx + 1) : modelName,
+            };
+        }
+    }
+
+    return null;
+}
+
 async function resolveUserGatewayContext(req, res, { requireProvisioned = true } = {}) {
     const userId = await requireClerkUserId(req, res);
     if (!userId) return null;
@@ -694,14 +733,14 @@ app.post('/api/providers/connect', async (req, res) => {
 app.post('/api/providers/custom', async (req, res) => {
     const ctx = await resolveVpsAgentContext(req, res);
     if (!ctx) return;
-    const { key, label, baseUrl, api, authHeader, headers, models } = req.body || {};
+    const { key, label, baseUrl, api, apiKey, authHeader, headers, models } = req.body || {};
     if (!key || !baseUrl) return res.status(400).json({ error: 'key and baseUrl are required' });
     const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/configure-custom-provider', {
-        instanceId: ctx.userId, key, label, baseUrl, api, authHeader, headers, models
+        instanceId: ctx.userId, key, label, baseUrl, api, apiKey, authHeader, headers, models
     });
     console.log(`[backend] vps-agent configure-custom-provider → ${status}`, data);
     if (!ok) return res.status(500).json({ error: data.error || 'Failed to save custom provider', detail: data });
-    res.json({ success: true });
+    res.json({ success: true, providerKey: data?.providerKey || key, provider: data?.provider || null });
 });
 
 // ── OAuth provider authentication ─────────────────────────────────────────────
@@ -1196,8 +1235,14 @@ app.put('/api/models/config', async (req, res) => {
     const { primary, fallbacks = [], allowedModels = [] } = req.body || {};
     if (!primary) return res.status(400).json({ error: 'primary model is required' });
 
+    const cleanedFallbacks = Array.from(new Set(
+        (Array.isArray(fallbacks) ? fallbacks : [])
+            .map((value) => String(value || '').trim())
+            .filter((value) => value && value !== primary)
+    ));
+
     // Ensure primary is in allowedModels
-    const allAllowed = [...new Set([primary, ...fallbacks, ...allowedModels])];
+    const allAllowed = [...new Set([primary, ...cleanedFallbacks, ...(Array.isArray(allowedModels) ? allowedModels : [])])];
 
     // Read current config first to preserve other settings
     const configPath = path.join(INSTANCES_DIR, ctx.userId, 'openclaw.json');
@@ -1218,13 +1263,19 @@ app.put('/api/models/config', async (req, res) => {
     config.agents.defaults = config.agents.defaults || {};
     config.agents.defaults.model = {
         primary,
-        fallbacks
+        fallbacks: cleanedFallbacks
     };
 
     // Update allowed models - convert array to object format
     config.agents.defaults.models = {};
     for (const modelKey of allAllowed) {
         config.agents.defaults.models[modelKey] = { enabled: true };
+    }
+
+    config.agents.list = Array.isArray(config.agents.list) ? config.agents.list : [];
+    const mainAgent = config.agents.list.find((agent) => agent?.id === 'main');
+    if (mainAgent) {
+        mainAgent.model = primary;
     }
 
     // Write back via VPS agent
@@ -1242,7 +1293,7 @@ app.put('/api/models/config', async (req, res) => {
             instanceId: ctx.userId,
             agentId: 'main',
             updates: {
-                model: { primary, fallbacks }
+                model: { primary, fallbacks: cleanedFallbacks }
             }
         });
     } catch (err) {
@@ -1614,16 +1665,14 @@ app.all('/api/chat', async (req, res) => {
 
             const config = JSON.parse(cfgData.content);
             const primaryModel = config.agents?.defaults?.model?.primary || '';
-            const slashIdx = primaryModel.indexOf('/');
-            const providerKey = slashIdx > 0 ? primaryModel.slice(0, slashIdx) : null;
-            const modelName = slashIdx > 0 ? primaryModel.slice(slashIdx + 1) : null;
-            if (!providerKey || !modelName) {
+            const resolved = resolveConfiguredProviderForModel(config, primaryModel);
+            if (!resolved?.resolvedProviderKey || !resolved?.modelName) {
                 return res.status(400).json({ error: 'No model/provider configured. Go to Settings → Models to configure one.' });
             }
 
-            const provider = config.models?.providers?.[providerKey];
+            const provider = resolved.provider;
             if (!provider?.baseUrl) {
-                return res.status(400).json({ error: `Provider "${providerKey}" has no baseUrl configured.` });
+                return res.status(400).json({ error: `Provider "${resolved.requestedProviderKey || resolved.resolvedProviderKey}" has no baseUrl configured.` });
             }
 
             const apiKey = provider.apiKey || null;
@@ -1637,13 +1686,13 @@ app.all('/api/chat', async (req, res) => {
             }
 
             const completionsUrl = `${provider.baseUrl.replace(/\/$/, '')}/chat/completions`;
-            console.log(`[backend] POST /api/chat → ${completionsUrl} (model: ${providerKey}/${modelName})`);
+            console.log(`[backend] POST /api/chat → ${completionsUrl} (model: ${resolved.resolvedProviderKey}/${resolved.modelName})`);
 
             const upstream = await fetch(completionsUrl, {
                 method: 'POST',
                 headers,
                 body: JSON.stringify({
-                    model: modelName,
+                    model: resolved.modelName,
                     messages: [{ role: 'user', content: message }],
                     stream: false
                 }),
