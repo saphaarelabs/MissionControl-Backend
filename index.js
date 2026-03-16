@@ -1713,11 +1713,10 @@ app.get('/api/tasks', async (req, res) => {
     if (!ctx) return;
 
     try {
-        const { ok, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/sessions-list', {
+        const { ok, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/tasks-list', {
             instanceId: ctx.userId,
             ids: req.query.ids || undefined,
             limit: parseInt(req.query.limit) || 100,
-            onlyTaskSessions: true,
             includeNarrative: req.query.includeNarrative === 'true',
             includeLog: req.query.includeLog === 'true'
         });
@@ -1726,7 +1725,7 @@ app.get('/api/tasks', async (req, res) => {
     res.json({ jobs: [] });
 });
 
-// ── Task creation (POST /api/tasks → chat.send with unique session) ──────────
+// ── Task creation (POST /api/tasks → vps-agent task registry + async run) ────
 app.post('/api/tasks', async (req, res) => {
     const ctx = await resolveVpsAgentContext(req, res);
     if (!ctx) return;
@@ -1734,17 +1733,13 @@ app.post('/api/tasks', async (req, res) => {
     const { message, agentId, priority, name } = req.body || {};
     if (!message) return res.status(400).json({ error: 'message is required' });
 
-    const aid = agentId || 'main';
-    // Each task gets its own session so it doesn't go to Telegram/existing channels
-    const taskId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const sessionKey = `agent:${aid}:${taskId}`;
-
     try {
-        const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/chat-send', {
+        const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/tasks-create', {
             instanceId: ctx.userId,
-            sessionKey,
             message,
-            idempotencyKey: taskId
+            agentId,
+            priority,
+            name
         });
         if (!ok) return res.status(status).json(data);
         res.json(data);
