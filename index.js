@@ -596,6 +596,33 @@ function gatewayWsSend(wsUrl, token, message, timeoutMs = 15_000) {
 }
 
 // ── GET /api/models/config — read directly from config file via vps-agent ──────
+app.get('/api/models', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+
+    try {
+        const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/models-list', {
+            instanceId: ctx.userId
+        });
+        if (!ok) return res.status(status).json(data);
+
+        const models = Array.isArray(data?.models) ? data.models : [];
+        const mapped = models.map((entry) => {
+            const key = entry?.key || entry?.id || entry?.model || '';
+            return {
+                key,
+                name: entry?.name || key,
+                provider: entry?.provider || String(key).split('/')[0] || ''
+            };
+        }).filter((entry) => entry.key);
+
+        return res.json({ models: mapped });
+    } catch (err) {
+        return res.status(502).json({ error: err.message });
+    }
+});
+
+// ── GET /api/models/config — read directly from config file via vps-agent ──────
 app.get('/api/models/config', async (req, res) => {
     const ctx = await resolveVpsAgentContext(req, res);
     if (!ctx) return;
@@ -1408,6 +1435,8 @@ app.get('/api/subagents', async (req, res) => {
                     model: primaryModel,
                     primaryModel,
                     fallbacks,
+                    capabilities: Array.isArray(a.capabilities) ? a.capabilities : [],
+                    toolkits: Array.isArray(a.toolkits) ? a.toolkits : [],
                     updatedAt: session.metadata?.updatedAt || null,
                     status: session.status || 'active'
                 };
@@ -1424,13 +1453,14 @@ app.get('/api/subagents', async (req, res) => {
 // Debug endpoint to verify deployment version
 app.get('/api/subagents/version', (req, res) => {
     res.json({
-        version: '2.1.0-agent-profile-create',
+        version: '2.2.0-manager-task-semantics',
         timestamp: new Date().toISOString(),
-        commit: '7da6cc5+',
+        commit: 'local-working-tree',
         features: {
             configBackedAgentList: true,
             profileBasedAgentCreate: true,
-            structuredResponse: true
+            structuredResponse: true,
+            managerTaskRouting: true
         }
     });
 });
