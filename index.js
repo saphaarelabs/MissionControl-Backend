@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import { verifyToken } from '@clerk/backend';
+import { Composio } from '@composio/core';
 import { createProxyMiddleware, fixRequestBody } from 'http-proxy-middleware';
 import WebSocket from 'ws';
 import crypto from 'crypto';
@@ -14,6 +15,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY;
 const CLERK_JWT_KEY = process.env.CLERK_JWT_KEY;
+const COMPOSIO_API_KEY = process.env.COMPOSIO_API_KEY || '';
 
 // Directory where instance data is stored on the VPS (used when constructing paths).
 // Prefer environment override in hosting environments; default matches vps-agent's default.
@@ -24,6 +26,100 @@ const supabaseAdmin = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
         auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }
     })
     : null;
+
+const composio = COMPOSIO_API_KEY
+    ? new Composio({
+        apiKey: COMPOSIO_API_KEY,
+        allowTracking: false,
+        host: 'mission-control-backend',
+    })
+    : null;
+
+const INTEGRATION_CATALOG = [
+    {
+        slug: 'notion',
+        name: 'Notion',
+        category: 'Knowledge',
+        description: 'Let agents draft pages, publish research notes, and hand off structured docs.',
+    },
+    {
+        slug: 'github',
+        name: 'GitHub',
+        category: 'Engineering',
+        description: 'Create issues, inspect repos, comment on PRs, and keep engineering work grounded.',
+    },
+    {
+        slug: 'slack',
+        name: 'Slack',
+        category: 'Comms',
+        description: 'Send updates, route approvals, and notify teams when work changes state.',
+    },
+    {
+        slug: 'gmail',
+        name: 'Gmail',
+        category: 'Comms',
+        description: 'Draft or send email follow-ups when a workflow truly needs an inbox.',
+    },
+    {
+        slug: 'googlecalendar',
+        name: 'Google Calendar',
+        category: 'Scheduling',
+        description: 'Schedule meetings, inspect availability, and coordinate time-sensitive work.',
+    },
+    {
+        slug: 'linear',
+        name: 'Linear',
+        category: 'Product',
+        description: 'Turn plans into tickets and sync agent work with product execution.',
+    },
+    {
+        slug: 'jira',
+        name: 'Jira',
+        category: 'Product',
+        description: 'Create and update enterprise work items when teams already operate in Jira.',
+    },
+    {
+        slug: 'discord',
+        name: 'Discord',
+        category: 'Community',
+        description: 'Post updates and coordinate work where community or internal ops run on Discord.',
+    },
+];
+
+function requireComposioClient(res) {
+    if (composio) return composio;
+    res.status(503).json({
+        error: 'COMPOSIO_API_KEY is not configured on the backend',
+        code: 'COMPOSIO_NOT_CONFIGURED',
+    });
+    return null;
+}
+
+async function createUserIntegrationSession(userId, toolkits = INTEGRATION_CATALOG.map((entry) => entry.slug)) {
+    return composio.create(userId, {
+        toolkits,
+        manageConnections: true,
+    });
+}
+
+function normalizeIntegrationToolkitState(entry, state) {
+    const connection = state?.connection;
+    const connectedAccount = connection?.connectedAccount;
+    return {
+        slug: entry.slug,
+        name: state?.name || entry.name,
+        category: entry.category,
+        description: entry.description,
+        logo: state?.logo || null,
+        isNoAuth: Boolean(state?.isNoAuth),
+        isConnected: Boolean(connection?.isActive),
+        connectionStatus: connectedAccount?.status || null,
+        connectedAccountId: connectedAccount?.id || null,
+        authConfigId: connection?.authConfig?.id || null,
+        authMode: connection?.authConfig?.mode || null,
+        isComposioManaged: Boolean(connection?.authConfig?.isComposioManaged),
+    };
+}
 
 function requireSupabaseAdmin(_req, res) {
     if (supabaseAdmin) return supabaseAdmin;
@@ -357,6 +453,127 @@ app.get('/api/cors-test', (req, res) => {
         allowedOrigins,
         timestamp: new Date().toISOString()
     });
+});
+
+// ── Connected apps / Composio integrations ──────────────────────────────────
+app.get('/api/integrations', async (req, res) => {
+    const userId = await requireClerkUserId(req, res);
+    if (!userId) return;
+
+    const client = requireComposioClient(res);
+    if (!client) return;
+
+    try {
+        const session = await createUserIntegrationSession(userId);
+        const toolkitsState = await session.toolkits({
+            toolkits: INTEGRATION_CATALOG.map((entry) => entry.slug),
+            limit: INTEGRATION_CATALOG.length,
+        });
+
+        const itemsBySlug = new Map(
+            (Array.isArray(toolkitsState?.items) ? toolkitsState.items : [])
+                .map((item) => [item.slug, item])
+        );
+
+        const integrations = INTEGRATION_CATALOG.map((entry) =>
+            normalizeIntegrationToolkitState(entry, itemsBySlug.get(entry.slug))
+        );
+
+        res.json({
+            integrations,
+            summary: {
+                total: integrations.length,
+                connected: integrations.filter((item) => item.isConnected).length,
+                pending: integrations.filter((item) => ['INITIATED', 'INITIALIZING'].includes(String(item.connectionStatus || ''))).length,
+            },
+        });
+    } catch (error) {
+        console.error('[backend] integrations/list error:', error);
+        res.status(502).json({
+            error: error?.message || 'Failed to load integrations',
+            code: 'INTEGRATIONS_LIST_FAILED',
+        });
+    }
+});
+
+app.post('/api/integrations/connect', async (req, res) => {
+    const userId = await requireClerkUserId(req, res);
+    if (!userId) return;
+
+    const client = requireComposioClient(res);
+    if (!client) return;
+
+    const toolkit = String(req.body?.toolkit || '').trim().toLowerCase();
+    const callbackUrl = typeof req.body?.callbackUrl === 'string' ? req.body.callbackUrl.trim() : '';
+    const integration = INTEGRATION_CATALOG.find((entry) => entry.slug === toolkit);
+
+    if (!integration) {
+        return res.status(400).json({
+            error: 'Unsupported integration toolkit',
+            supportedToolkits: INTEGRATION_CATALOG.map((entry) => entry.slug),
+        });
+    }
+
+    try {
+        const session = await createUserIntegrationSession(userId, [toolkit]);
+        const request = await session.authorize(toolkit, callbackUrl ? { callbackUrl } : undefined);
+        const redirectUrl = request?.redirectUrl || null;
+
+        if (!redirectUrl) {
+            return res.status(200).json({
+                success: true,
+                toolkit,
+                connectedAccountId: request?.id || null,
+                redirectUrl: null,
+                message: `${integration.name} connection is already active or does not require a redirect.`,
+            });
+        }
+
+        return res.json({
+            success: true,
+            toolkit,
+            connectedAccountId: request?.id || null,
+            redirectUrl,
+        });
+    } catch (error) {
+        console.error('[backend] integrations/connect error:', error);
+        return res.status(502).json({
+            error: error?.message || 'Failed to start integration connection',
+            code: 'INTEGRATION_CONNECT_FAILED',
+        });
+    }
+});
+
+app.delete('/api/integrations/:connectedAccountId', async (req, res) => {
+    const userId = await requireClerkUserId(req, res);
+    if (!userId) return;
+
+    const client = requireComposioClient(res);
+    if (!client) return;
+
+    const connectedAccountId = String(req.params.connectedAccountId || '').trim();
+    if (!connectedAccountId) {
+        return res.status(400).json({ error: 'connectedAccountId is required' });
+    }
+
+    try {
+        const existing = await client.connectedAccounts.list({
+            userIds: [userId],
+        });
+        const ownedAccount = (existing.items || []).find((item) => item.id === connectedAccountId);
+        if (!ownedAccount) {
+            return res.status(404).json({ error: 'Connected account not found for this user' });
+        }
+
+        await client.connectedAccounts.delete(connectedAccountId);
+        return res.json({ success: true, connectedAccountId });
+    } catch (error) {
+        console.error('[backend] integrations/delete error:', error);
+        return res.status(502).json({
+            error: error?.message || 'Failed to disconnect integration',
+            code: 'INTEGRATION_DELETE_FAILED',
+        });
+    }
 });
 
 // ── User profile sync (upsert + trigger control plane provisioning) ────────────
