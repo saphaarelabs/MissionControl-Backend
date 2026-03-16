@@ -106,6 +106,34 @@ async function createUserIntegrationSession(userId, toolkits = INTEGRATION_CATAL
     });
 }
 
+async function syncUserIntegrationSessionToInstance(ctx) {
+    const session = await createUserIntegrationSession(ctx.userId);
+    const mcp = session?.mcp;
+    if (!mcp?.url) {
+        throw new Error('Composio session did not return MCP server details');
+    }
+
+    const payload = {
+        instanceId: ctx.userId,
+        mcp: {
+            transport: mcp.type || 'http',
+            url: mcp.url,
+            headers: mcp.headers || {},
+        },
+    };
+
+    const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/composio-configure-session', payload);
+    if (!ok) {
+        throw new Error(data?.error || `Failed to sync Composio session to instance (${status})`);
+    }
+
+    return {
+        sessionId: session?.sessionId || null,
+        mcp: payload.mcp,
+        instanceSync: data,
+    };
+}
+
 function normalizeIntegrationToolkitState(entry, state) {
     const connection = state?.connection;
     const connectedAccount = connection?.connectedAccount;
@@ -467,8 +495,17 @@ app.get('/api/integrations', async (req, res) => {
     const client = requireComposioClient(res);
     if (!client) return;
 
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+
     try {
         const session = await createUserIntegrationSession(userId);
+        let instanceSync = null;
+        try {
+            instanceSync = await syncUserIntegrationSessionToInstance(ctx);
+        } catch (syncError) {
+            console.warn('[backend] integrations/list instance sync warning:', syncError.message);
+        }
         const toolkitsState = await session.toolkits({
             toolkits: INTEGRATION_CATALOG.map((entry) => entry.slug),
             limit: INTEGRATION_CATALOG.length,
@@ -490,6 +527,7 @@ app.get('/api/integrations', async (req, res) => {
                 connected: integrations.filter((item) => item.isConnected).length,
                 pending: integrations.filter((item) => ['INITIATED', 'INITIALIZING'].includes(String(item.connectionStatus || ''))).length,
             },
+            instanceSync,
         });
     } catch (error) {
         console.error('[backend] integrations/list error:', error);
@@ -507,6 +545,9 @@ app.post('/api/integrations/connect', async (req, res) => {
     const client = requireComposioClient(res);
     if (!client) return;
 
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+
     const toolkit = String(req.body?.toolkit || '').trim().toLowerCase();
     const callbackUrl = typeof req.body?.callbackUrl === 'string' ? req.body.callbackUrl.trim() : '';
     const integration = INTEGRATION_CATALOG.find((entry) => entry.slug === toolkit);
@@ -520,6 +561,12 @@ app.post('/api/integrations/connect', async (req, res) => {
 
     try {
         const session = await createUserIntegrationSession(userId, [toolkit]);
+        let instanceSync = null;
+        try {
+            instanceSync = await syncUserIntegrationSessionToInstance(ctx);
+        } catch (syncError) {
+            console.warn('[backend] integrations/connect instance sync warning:', syncError.message);
+        }
         const request = await session.authorize(toolkit, callbackUrl ? { callbackUrl } : undefined);
         const redirectUrl = request?.redirectUrl || null;
 
@@ -530,6 +577,7 @@ app.post('/api/integrations/connect', async (req, res) => {
                 connectedAccountId: request?.id || null,
                 redirectUrl: null,
                 message: `${integration.name} connection is already active or does not require a redirect.`,
+                instanceSync,
             });
         }
 
@@ -538,6 +586,7 @@ app.post('/api/integrations/connect', async (req, res) => {
             toolkit,
             connectedAccountId: request?.id || null,
             redirectUrl,
+            instanceSync,
         });
     } catch (error) {
         console.error('[backend] integrations/connect error:', error);
@@ -555,6 +604,9 @@ app.delete('/api/integrations/:connectedAccountId', async (req, res) => {
     const client = requireComposioClient(res);
     if (!client) return;
 
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+
     const connectedAccountId = String(req.params.connectedAccountId || '').trim();
     if (!connectedAccountId) {
         return res.status(400).json({ error: 'connectedAccountId is required' });
@@ -570,7 +622,13 @@ app.delete('/api/integrations/:connectedAccountId', async (req, res) => {
         }
 
         await client.connectedAccounts.delete(connectedAccountId);
-        return res.json({ success: true, connectedAccountId });
+        let instanceSync = null;
+        try {
+            instanceSync = await syncUserIntegrationSessionToInstance(ctx);
+        } catch (syncError) {
+            console.warn('[backend] integrations/delete instance sync warning:', syncError.message);
+        }
+        return res.json({ success: true, connectedAccountId, instanceSync });
     } catch (error) {
         console.error('[backend] integrations/delete error:', error);
         return res.status(502).json({
