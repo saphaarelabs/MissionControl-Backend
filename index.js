@@ -569,7 +569,7 @@ function gatewayWsSend(wsUrl, token, message, timeoutMs = 15_000) {
                         caps: [],
                         auth: { token },
                         role: 'operator',
-                        scopes: ['operator.admin']
+                        scopes: ['operator.read', 'operator.write']
                     }
                 }));
                 return;
@@ -1432,74 +1432,8 @@ app.get('/api/subagents/version', (req, res) => {
 });
 
 app.post('/api/subagents/spawn', async (req, res) => {
-    const gateway = await resolveUserGatewayContext(req, res, { requireProvisioned: true });
-    if (!gateway) return;
-    if (!gateway.gatewayToken) return res.status(403).json({ error: 'Missing gateway token' });
-
     const { task, label, model, agentId } = req.body || {};
     if (!task) return res.status(400).json({ error: 'task is required' });
-
-    // Generate agent ID from label or timestamp
-    const aid = agentId || (label || 'sub-' + Date.now()).toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 30);
-
-    console.log(`[backend] spawn subagent: wsUrl=${gateway.wsUrl ? 'YES' : 'NO'}, aid=${aid}, label=${label}`);
-
-    // Try direct WebSocket first, fall back to vps-agent (docker exec)
-    if (gateway.wsUrl) {
-        try {
-            console.log(`[backend] spawn: trying WS ${gateway.wsUrl}, creating agent ${aid}`);
-            
-            // Step 1: Create the agent
-            const createMessage = {
-                type: 'req', 
-                id: `create-${Date.now()}`,
-                method: 'agents.create',
-                params: {
-                    name: aid,
-                    workspace: `/home/node/.openclaw/agents/${aid}`
-                }
-            };
-            
-            console.log(`[backend] sending agents.create for ${aid}...`);
-            const createResult = await gatewayWsSend(gateway.wsUrl, gateway.gatewayToken, createMessage);
-            console.log(`[backend] agents.create result:`, JSON.stringify(createResult).slice(0, 300));
-            
-            if (!createResult.ok && createResult.error) {
-                console.error(`[backend] agents.create failed:`, createResult.error);
-                return res.status(400).json({ error: createResult.error?.message || 'Failed to create agent' });
-            }
-
-            // Step 2: Send the initial task message
-            const chatMessage = {
-                type: 'req', 
-                id: `spawn-${Date.now()}`,
-                method: 'chat.send',
-                params: {
-                    sessionKey: `agent:${aid}:${aid}`,
-                    message: task,
-                    idempotencyKey: `spawn-${Date.now()}-${Math.random().toString(36).slice(2)}`
-                }
-            };
-            
-            console.log(`[backend] sending chat.send to agent:${aid}:${aid}...`);
-            const chatResult = await gatewayWsSend(gateway.wsUrl, gateway.gatewayToken, chatMessage);
-            console.log(`[backend] chat.send result:`, JSON.stringify(chatResult).slice(0, 300));
-            
-            return res.json({
-                ok: true,
-                version: '2.0-subagent-fix',
-                agent: { id: aid, name: label || aid },
-                chat: chatResult?.payload || chatResult
-            });
-        } catch (err) {
-            console.error(`[backend] spawn WS error:`, err);
-            console.warn(`[backend] spawn WS failed (${err.message}), falling back to vps-agent`);
-        }
-    } else {
-        console.log(`[backend] No wsUrl, using vps-agent fallback directly`);
-    }
-
-    // Fallback: vps-agent docker exec approach
     try {
         const ctx = await resolveVpsAgentContext(req, res);
         if (!ctx) return;
@@ -1507,10 +1441,10 @@ app.post('/api/subagents/spawn', async (req, res) => {
             instanceId: ctx.userId, task, label, model, agentId
         });
         if (!ok) return res.status(status).json(data);
-        console.log(`[backend] sub-agent spawned via vps-agent:`, data);
+        console.log(`[backend] sub-agent spawned via vps-agent`);
         res.json(data);
     } catch (err) {
-        console.error('[backend] subagents/spawn fallback error:', err.message);
+        console.error('[backend] subagents/spawn error:', err.message);
         res.status(502).json({ error: err.message });
     }
 });
