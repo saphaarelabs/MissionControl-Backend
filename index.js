@@ -1399,11 +1399,15 @@ app.get('/api/subagents', async (req, res) => {
             .filter(a => a.id !== 'main')
             .map(a => {
                 const session = sessionMap[a.id] || {};
+                const primaryModel = session.model || a.primaryModel || a.model || '';
+                const fallbacks = Array.isArray(a.fallbacks) ? a.fallbacks : [];
                 return {
                     sessionKey: `agent:${a.id}:${a.id}`,
                     id: a.id,
                     label: a.name || a.id,
-                    model: session.model || '',
+                    model: primaryModel,
+                    primaryModel,
+                    fallbacks,
                     updatedAt: session.metadata?.updatedAt || null,
                     status: session.status || 'active'
                 };
