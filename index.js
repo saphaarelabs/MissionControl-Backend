@@ -1651,10 +1651,45 @@ app.post('/api/channels/login', async (req, res) => {
 app.all('/api/chat', async (req, res) => {
     if (req.method === 'GET') {
         const { action } = req.query;
-        const userId = await requireClerkUserId(req, res);
-        if (!userId) return;
-        if (action === 'sessions') return res.json({ sessions: [] });
-        if (action === 'history') return res.json({ messages: [] });
+        const ctx = await resolveVpsAgentContext(req, res);
+        if (!ctx) return;
+
+        if (action === 'sessions') {
+            try {
+                const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 30, 200));
+                const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/chat-sessions', {
+                    instanceId: ctx.userId,
+                    limit
+                });
+                if (!ok) return res.status(status).json(data);
+                return res.json({ sessions: Array.isArray(data?.sessions) ? data.sessions : [] });
+            } catch (err) {
+                console.error('[backend] GET /api/chat?action=sessions error:', err.message);
+                return res.status(502).json({ error: err.message, sessions: [] });
+            }
+        }
+
+        if (action === 'history') {
+            const sessionKey = String(req.query.sessionKey || '').trim();
+            if (!sessionKey) return res.status(400).json({ error: 'sessionKey is required', messages: [] });
+
+            try {
+                const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 100, 500));
+                const includeTools = req.query.includeTools === 'true';
+                const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/chat-history', {
+                    instanceId: ctx.userId,
+                    sessionKey,
+                    limit,
+                    includeTools
+                });
+                if (!ok) return res.status(status).json(data);
+                return res.json({ messages: Array.isArray(data?.messages) ? data.messages : [] });
+            } catch (err) {
+                console.error('[backend] GET /api/chat?action=history error:', err.message);
+                return res.status(502).json({ error: err.message, messages: [] });
+            }
+        }
+
         return res.json({});
     }
 
@@ -1742,6 +1777,7 @@ app.get('/api/tasks', async (req, res) => {
             instanceId: ctx.userId,
             ids: req.query.ids || undefined,
             limit: parseInt(req.query.limit) || 100,
+            onlyTaskSessions: true,
             includeNarrative: req.query.includeNarrative === 'true',
             includeLog: req.query.includeLog === 'true'
         });
