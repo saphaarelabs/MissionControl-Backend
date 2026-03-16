@@ -1779,7 +1779,7 @@ app.post('/api/tasks', async (req, res) => {
     }
 });
 
-// ── Broadcast (POST /api/broadcast → chat.send to multiple agents) ───────────
+// ── Broadcast (POST /api/broadcast → direct agent runs tracked as bcast tasks) ──
 app.post('/api/broadcast', async (req, res) => {
     const ctx = await resolveVpsAgentContext(req, res);
     if (!ctx) return;
@@ -1788,23 +1788,18 @@ app.post('/api/broadcast', async (req, res) => {
     if (!message) return res.status(400).json({ error: 'message is required' });
     const agents = Array.isArray(agentIds) && agentIds.length ? agentIds : ['main'];
 
-    const tasks = [];
-    for (const aid of agents) {
-        try {
-            const taskId = `bcast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-            const { ok, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/chat-send', {
-                instanceId: ctx.userId,
-                sessionKey: `agent:${aid}:${taskId}`,
-                message,
-                idempotencyKey: taskId
-            });
-            tasks.push({ agentId: aid, ok, ...(data || {}) });
-        } catch (err) {
-            tasks.push({ agentId: aid, ok: false, error: err.message });
-        }
+    try {
+        const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/broadcast-create', {
+            instanceId: ctx.userId,
+            message,
+            agentIds: agents
+        });
+        if (!ok) return res.status(status).json(data);
+        res.json(data);
+    } catch (err) {
+        console.error('[backend] broadcast error:', err.message);
+        res.status(502).json({ error: err.message });
     }
-
-    res.json({ tasks });
 });
 
 // ── Heartbeat stub ────────────────────────────────────────────────────────────
