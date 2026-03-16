@@ -15,7 +15,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY;
 const CLERK_JWT_KEY = process.env.CLERK_JWT_KEY;
-const COMPOSIO_API_KEY = process.env.COMPOSIO_API_KEY || '';
+const COMPOSIO_API_KEY = process.env.COMPOSIO_PROJECT_API_KEY || process.env.COMPOSIO_API_KEY || '';
 
 // Directory where instance data is stored on the VPS (used when constructing paths).
 // Prefer environment override in hosting environments; default matches vps-agent's default.
@@ -34,6 +34,10 @@ const composio = COMPOSIO_API_KEY
         host: 'mission-control-backend',
     })
     : null;
+
+if (COMPOSIO_API_KEY && COMPOSIO_API_KEY.startsWith('ck_')) {
+    console.warn('[backend] COMPOSIO_PROJECT_API_KEY appears to be a Composio Connect consumer key (ck_*). The backend SDK requires a project API key, not the MCP consumer key.');
+}
 
 const INTEGRATION_CATALOG = [
     {
@@ -89,7 +93,7 @@ const INTEGRATION_CATALOG = [
 function requireComposioClient(res) {
     if (composio) return composio;
     res.status(503).json({
-        error: 'COMPOSIO_API_KEY is not configured on the backend',
+        error: 'Composio project API key is not configured on the backend. Set COMPOSIO_PROJECT_API_KEY (preferred) or COMPOSIO_API_KEY.',
         code: 'COMPOSIO_NOT_CONFIGURED',
     });
     return null;
