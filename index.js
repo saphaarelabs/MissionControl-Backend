@@ -1420,25 +1420,27 @@ app.get('/api/subagents', async (req, res) => {
 // Debug endpoint to verify deployment version
 app.get('/api/subagents/version', (req, res) => {
     res.json({
-        version: '2.0.0-subagent-spawn-fix',
+        version: '2.1.0-agent-profile-create',
         timestamp: new Date().toISOString(),
-        commit: 'ec65745+',
+        commit: '7da6cc5+',
         features: {
-            wsAgentsCreate: true,
-            detailedLogging: true,
+            configBackedAgentList: true,
+            profileBasedAgentCreate: true,
             structuredResponse: true
         }
     });
 });
 
 app.post('/api/subagents/spawn', async (req, res) => {
-    const { task, label, model, agentId } = req.body || {};
-    if (!task) return res.status(400).json({ error: 'task is required' });
+    const { initialTask, label, model, agentId, identityMd, soulMd, agentsMd } = req.body || {};
+    if (![label, identityMd, soulMd, agentsMd, initialTask].some((value) => String(value || '').trim())) {
+        return res.status(400).json({ error: 'Provide at least a label or one agent profile field' });
+    }
     try {
         const ctx = await resolveVpsAgentContext(req, res);
         if (!ctx) return;
         const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/subagents-spawn', {
-            instanceId: ctx.userId, task, label, model, agentId
+            instanceId: ctx.userId, initialTask, label, model, agentId, identityMd, soulMd, agentsMd
         });
         if (!ok) return res.status(status).json(data);
         console.log(`[backend] sub-agent spawned via vps-agent`);
