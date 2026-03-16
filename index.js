@@ -1282,7 +1282,7 @@ app.put('/api/models/config', async (req, res) => {
     // Update allowed models - convert array to object format
     config.agents.defaults.models = {};
     for (const modelKey of allAllowed) {
-        config.agents.defaults.models[modelKey] = { enabled: true };
+        config.agents.defaults.models[modelKey] = {};
     }
 
     config.agents.list = Array.isArray(config.agents.list) ? config.agents.list : [];
