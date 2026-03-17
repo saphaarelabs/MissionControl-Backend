@@ -134,6 +134,20 @@ async function syncUserIntegrationSessionToInstance(ctx) {
     };
 }
 
+async function maybeSyncComposioSessionToInstance(ctx, { reason = 'runtime' } = {}) {
+    if (!composio || !ctx?.userId || !ctx?.agentBaseUrl) {
+        return { ok: false, skipped: true, reason: 'composio_not_configured' };
+    }
+
+    try {
+        const result = await syncUserIntegrationSessionToInstance(ctx);
+        return { ok: true, skipped: false, reason, ...result };
+    } catch (error) {
+        console.warn(`[backend] composio sync skipped during ${reason}: ${error.message}`);
+        return { ok: false, skipped: false, reason, error: error.message };
+    }
+}
+
 function normalizeIntegrationToolkitState(entry, state) {
     const connection = state?.connection;
     const connectedAccount = connection?.connectedAccount;
@@ -1752,6 +1766,7 @@ app.post('/api/subagents/spawn', async (req, res) => {
     try {
         const ctx = await resolveVpsAgentContext(req, res);
         if (!ctx) return;
+        await maybeSyncComposioSessionToInstance(ctx, { reason: 'subagent_spawn' });
         const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/subagents-spawn', {
             instanceId: ctx.userId, initialTask, label, model, agentId, identityMd, soulMd, agentsMd
         });
@@ -2043,6 +2058,7 @@ app.post('/api/tasks', async (req, res) => {
     if (!message) return res.status(400).json({ error: 'message is required' });
 
     try {
+        await maybeSyncComposioSessionToInstance(ctx, { reason: 'task_create' });
         const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/tasks-create', {
             instanceId: ctx.userId,
             message,
@@ -2068,6 +2084,7 @@ app.post('/api/broadcast', async (req, res) => {
     const agents = Array.isArray(agentIds) && agentIds.length ? agentIds : ['main'];
 
     try {
+        await maybeSyncComposioSessionToInstance(ctx, { reason: 'broadcast_create' });
         const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/broadcast-create', {
             instanceId: ctx.userId,
             message,
