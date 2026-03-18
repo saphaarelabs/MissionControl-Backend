@@ -22,6 +22,17 @@ const XPAY_PRIVATE_KEY = process.env.XPAY_PRIVATE_KEY || '';
 const XPAY_WEBHOOK_SIGNER = process.env.XPAY_WEBHOOK_SIGNER || '';
 const APP_BASE_URL = process.env.APP_BASE_URL || process.env.FRONTEND_URL || 'https://mission-control-frontend-kappa.vercel.app';
 
+// Temporary billing bypass allowlist. Remove when no longer needed.
+const BILLING_BYPASS_EMAILS = new Set([
+    'chitluridevicharan@gmail.com',
+    'everyai.com@gmail.com',
+    'everyn8n@gmail.com',
+    'saphaarelabs@gmail.com',
+    'rukminidevichitluri@gmail.com',
+    'devicharanchitluri@gmail.com',
+    'rukminidevichitluri9090@gmail.com',
+].map((email) => email.toLowerCase()));
+
 // Directory where instance data is stored on the VPS (used when constructing paths).
 // Prefer environment override in hosting environments; default matches vps-agent's default.
 const INSTANCES_DIR = process.env.INSTANCES_DIR || '/var/lib/openclaw/instances';
@@ -119,6 +130,12 @@ async function requireActiveBillingUser(req, res) {
 
     const sb = requireSupabaseAdmin(req, res);
     if (!sb) return null;
+
+    const billingBypassEmail = normalizeEmail(req._clerkAuth?.email);
+    if (billingBypassEmail && BILLING_BYPASS_EMAILS.has(billingBypassEmail)) {
+        console.log(`[billing] bypassing subscription check for ${billingBypassEmail}`);
+        return { userId, record: null, sb, billingBypass: true, billingEmail: billingBypassEmail };
+    }
 
     try {
         const record = await getBillingRecordForUser(sb, userId);
@@ -343,6 +360,36 @@ function getBearerToken(req) {
     return match?.[1]?.trim() || null;
 }
 
+function normalizeEmail(value) {
+    if (!value || typeof value !== 'string') return '';
+    const normalized = value.trim().toLowerCase();
+    return normalized.includes('@') ? normalized : '';
+}
+
+function extractEmailFromClerkClaims(claims) {
+    if (!claims) return '';
+    const candidates = [];
+
+    if (claims.email) candidates.push(claims.email);
+    if (claims.email_address) candidates.push(claims.email_address);
+    if (claims.primary_email_address) candidates.push(claims.primary_email_address);
+
+    if (Array.isArray(claims.email_addresses)) {
+        for (const entry of claims.email_addresses) {
+            if (!entry) continue;
+            if (typeof entry === 'string') {
+                candidates.push(entry);
+            } else if (entry.email_address) {
+                candidates.push(entry.email_address);
+            } else if (entry.email) {
+                candidates.push(entry.email);
+            }
+        }
+    }
+
+    return candidates.map(normalizeEmail).find(Boolean) || '';
+}
+
 async function requireClerkUserId(req, res) {
     const token = getBearerToken(req);
     if (!token) {
@@ -368,6 +415,8 @@ async function requireClerkUserId(req, res) {
             res.status(401).json({ error: 'Invalid token (missing sub claim)' });
             return null;
         }
+        const email = extractEmailFromClerkClaims(verified);
+        req._clerkAuth = { userId, email, claims: verified };
         return userId;
     } catch (err) {
         console.warn(`[backend] AUTH 401 ${req.method} ${req.path} — ${err.message}`);
@@ -444,19 +493,24 @@ async function resolveUserGatewayContext(req, res, { requireProvisioned = true }
     const sb = requireSupabaseAdmin(req, res);
     if (!sb) return null;
 
-    try {
-        const billing = await getBillingRecordForUser(sb, userId);
-        if (!billing || !isBillingActiveStatus(billing.status)) {
-            res.status(402).json({
-                error: 'Active subscription required',
-                code: 'BILLING_REQUIRED',
-                billing: billing || null,
-            });
+    const billingBypassEmail = normalizeEmail(req._clerkAuth?.email);
+    if (!BILLING_BYPASS_EMAILS.has(billingBypassEmail)) {
+        try {
+            const billing = await getBillingRecordForUser(sb, userId);
+            if (!billing || !isBillingActiveStatus(billing.status)) {
+                res.status(402).json({
+                    error: 'Active subscription required',
+                    code: 'BILLING_REQUIRED',
+                    billing: billing || null,
+                });
+                return null;
+            }
+        } catch (error) {
+            res.status(500).json({ error: error.message || 'Failed to verify billing state' });
             return null;
         }
-    } catch (error) {
-        res.status(500).json({ error: error.message || 'Failed to verify billing state' });
-        return null;
+    } else {
+        console.log(`[billing] bypassing gateway subscription check for ${billingBypassEmail}`);
     }
 
     const { data, error } = await sb
