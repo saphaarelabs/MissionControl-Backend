@@ -2486,6 +2486,32 @@ app.post('/api/tasks', async (req, res) => {
     }
 });
 
+app.post('/api/tasks/:taskId/action', async (req, res) => {
+    const ctx = await resolveVpsAgentContext(req, res);
+    if (!ctx) return;
+
+    const taskId = String(req.params.taskId || '').trim();
+    const { action, note } = req.body || {};
+    if (!taskId || !action) {
+        return res.status(400).json({ error: 'taskId and action are required' });
+    }
+
+    try {
+        await maybeSyncComposioSessionToInstance(ctx, { reason: `task_action_${action}` });
+        const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/tasks-action', {
+            instanceId: ctx.userId,
+            taskId,
+            action,
+            note
+        });
+        if (!ok) return res.status(status).json(data);
+        res.json(data);
+    } catch (err) {
+        console.error('[backend] task action error:', err.message);
+        res.status(502).json({ error: err.message });
+    }
+});
+
 // ── Broadcast (POST /api/broadcast → direct agent runs tracked as bcast tasks) ──
 app.post('/api/broadcast', async (req, res) => {
     const ctx = await resolveVpsAgentContext(req, res);
