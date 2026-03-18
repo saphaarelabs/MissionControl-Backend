@@ -16,6 +16,11 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY;
 const CLERK_JWT_KEY = process.env.CLERK_JWT_KEY;
 const COMPOSIO_API_KEY = process.env.COMPOSIO_PROJECT_API_KEY || process.env.COMPOSIO_API_KEY || '';
+const XPAY_BASE_URL = process.env.XPAY_BASE_URL || 'https://api.test.xpaycheckout.com';
+const XPAY_PUBLIC_KEY = process.env.XPAY_PUBLIC_KEY || '';
+const XPAY_PRIVATE_KEY = process.env.XPAY_PRIVATE_KEY || '';
+const XPAY_WEBHOOK_SIGNER = process.env.XPAY_WEBHOOK_SIGNER || '';
+const APP_BASE_URL = process.env.APP_BASE_URL || process.env.FRONTEND_URL || 'https://mission-control-frontend-kappa.vercel.app';
 
 // Directory where instance data is stored on the VPS (used when constructing paths).
 // Prefer environment override in hosting environments; default matches vps-agent's default.
@@ -37,6 +42,162 @@ const composio = COMPOSIO_API_KEY
 
 if (COMPOSIO_API_KEY && COMPOSIO_API_KEY.startsWith('ck_')) {
     console.warn('[backend] COMPOSIO_PROJECT_API_KEY appears to be a Composio Connect consumer key (ck_*). The backend SDK requires a project API key, not the MCP consumer key.');
+}
+
+const BILLING_PLANS = [
+    {
+        key: 'starter-monthly',
+        label: 'Starter',
+        billingCycle: 'monthly',
+        amountCents: 1900,
+        currency: 'USD',
+        displayAmount: '$19',
+        cadenceLabel: 'per month',
+        xpayInterval: 'MONTH',
+        xpayIntervalCount: 1,
+        xpayCycleCount: 120,
+    },
+    {
+        key: 'starter-yearly',
+        label: 'Starter',
+        billingCycle: 'yearly',
+        amountCents: 18000,
+        currency: 'USD',
+        displayAmount: '$15',
+        cadenceLabel: 'per month billed yearly',
+        xpayInterval: 'YEAR',
+        xpayIntervalCount: 1,
+        xpayCycleCount: 10,
+    },
+];
+
+function getBillingPlan(planKey) {
+    return BILLING_PLANS.find((plan) => plan.key === planKey) || null;
+}
+
+function isBillingActiveStatus(status) {
+    return ['active', 'trialing'].includes(String(status || '').trim().toLowerCase());
+}
+
+function requireXpayConfig(res) {
+    if (XPAY_PUBLIC_KEY && XPAY_PRIVATE_KEY) {
+        return true;
+    }
+    res.status(503).json({
+        error: 'XPay is not configured on the backend. Set XPAY_PUBLIC_KEY and XPAY_PRIVATE_KEY.',
+        code: 'XPAY_NOT_CONFIGURED',
+    });
+    return false;
+}
+
+function buildXpayAuthorizationHeader() {
+    return `Basic ${Buffer.from(`${XPAY_PUBLIC_KEY}:${XPAY_PRIVATE_KEY}`).toString('base64')}`;
+}
+
+function createReceiptId(userId, planKey) {
+    const suffix = crypto.randomUUID ? crypto.randomUUID().slice(0, 12) : `${Date.now()}`;
+    return `mc_${userId}_${planKey}_${suffix}`.replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 120);
+}
+
+async function getBillingRecordForUser(sb, userId) {
+    const { data, error } = await sb
+        .from('billing_subscriptions')
+        .select('*')
+        .eq('userid', userId)
+        .maybeSingle();
+
+    if (error) {
+        throw error;
+    }
+
+    return data || null;
+}
+
+async function requireActiveBillingUser(req, res) {
+    const userId = await requireClerkUserId(req, res);
+    if (!userId) return null;
+
+    const sb = requireSupabaseAdmin(req, res);
+    if (!sb) return null;
+
+    try {
+        const record = await getBillingRecordForUser(sb, userId);
+        if (record && isBillingActiveStatus(record.status)) {
+            return { userId, record, sb };
+        }
+
+        res.status(402).json({
+            error: 'Active subscription required',
+            code: 'BILLING_REQUIRED',
+            billing: record,
+        });
+        return null;
+    } catch (error) {
+        res.status(500).json({ error: error.message || 'Failed to verify billing state' });
+        return null;
+    }
+}
+
+function extractXpaySignature(req) {
+    return req.headers['x-signature']
+        || req.headers['x-webhook-signature']
+        || req.headers['x-xpay-signature']
+        || req.headers.signature
+        || '';
+}
+
+function verifyXpayWebhookSignature(req) {
+    if (!XPAY_WEBHOOK_SIGNER) {
+        return { ok: false, reason: 'signer_not_configured' };
+    }
+
+    const signature = String(extractXpaySignature(req) || '').trim();
+    if (!signature) {
+        return { ok: false, reason: 'missing_signature' };
+    }
+
+    const rawBody = Buffer.isBuffer(req.rawBody)
+        ? req.rawBody
+        : Buffer.from(typeof req.rawBody === 'string' ? req.rawBody : JSON.stringify(req.body || {}));
+
+    const expectedCandidates = [
+        crypto.createHmac('sha256', XPAY_WEBHOOK_SIGNER).update(rawBody).digest('hex'),
+        crypto.createHmac('sha256', XPAY_WEBHOOK_SIGNER).update(rawBody).digest('base64'),
+        crypto.createHmac('sha512', XPAY_WEBHOOK_SIGNER).update(rawBody).digest('hex'),
+        crypto.createHmac('sha512', XPAY_WEBHOOK_SIGNER).update(rawBody).digest('base64'),
+    ];
+
+    const normalizedSignature = signature.replace(/^sha(256|512)=/i, '');
+    const matched = expectedCandidates.some((candidate) => {
+        const candidateBuffer = Buffer.from(candidate);
+        const signatureBuffer = Buffer.from(normalizedSignature);
+        return candidateBuffer.length === signatureBuffer.length
+            && crypto.timingSafeEqual(candidateBuffer, signatureBuffer);
+    });
+
+    return { ok: matched, reason: matched ? 'matched' : 'signature_mismatch' };
+}
+
+function mapXpayEventToLocalStatus(eventType, currentStatus) {
+    const normalizedEvent = String(eventType || '').toLowerCase();
+    const normalizedCurrent = String(currentStatus || '').toLowerCase();
+
+    if (normalizedEvent.includes('subscription.active') || normalizedEvent.includes('subscription.cycle_charged')) {
+        return 'active';
+    }
+    if (normalizedEvent.includes('subscription.trialing')) {
+        return 'trialing';
+    }
+    if (normalizedEvent.includes('subscription.unpaid') || normalizedEvent.includes('subscription.payment_failed')) {
+        return 'past_due';
+    }
+    if (normalizedEvent.includes('subscription.cancel') || normalizedEvent.includes('subscription.ended') || normalizedEvent.includes('subscription.expired')) {
+        return 'canceled';
+    }
+    if (normalizedCurrent) {
+        return normalizedCurrent;
+    }
+    return 'pending';
 }
 
 const INTEGRATION_CATALOG = [
@@ -283,6 +444,21 @@ async function resolveUserGatewayContext(req, res, { requireProvisioned = true }
     const sb = requireSupabaseAdmin(req, res);
     if (!sb) return null;
 
+    try {
+        const billing = await getBillingRecordForUser(sb, userId);
+        if (!billing || !isBillingActiveStatus(billing.status)) {
+            res.status(402).json({
+                error: 'Active subscription required',
+                code: 'BILLING_REQUIRED',
+                billing: billing || null,
+            });
+            return null;
+        }
+    } catch (error) {
+        res.status(500).json({ error: error.message || 'Failed to verify billing state' });
+        return null;
+    }
+
     const { data, error } = await sb
         .from('user_profiles')
         .select('operation_status, instance_url, gateway_token, local_websocket')
@@ -377,7 +553,12 @@ app.use((req, res, next) => {
     next();
 });
 
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({
+    limit: '2mb',
+    verify: (req, _res, buf) => {
+        req.rawBody = Buffer.from(buf);
+    }
+}));
 
 // ── Request logger ────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
@@ -499,6 +680,239 @@ app.get('/api/cors-test', (req, res) => {
         allowedOrigins,
         timestamp: new Date().toISOString()
     });
+});
+
+// ── Billing / pricing ───────────────────────────────────────────────────────
+app.get('/api/billing/plans', (_req, res) => {
+    res.json({
+        plans: BILLING_PLANS.map((plan) => ({
+            key: plan.key,
+            label: plan.label,
+            billingCycle: plan.billingCycle,
+            amountCents: plan.amountCents,
+            currency: plan.currency,
+            displayAmount: plan.displayAmount,
+            cadenceLabel: plan.cadenceLabel,
+        })),
+    });
+});
+
+app.get('/api/billing/subscription', async (req, res) => {
+    const userId = await requireClerkUserId(req, res);
+    if (!userId) return;
+
+    const sb = requireSupabaseAdmin(req, res);
+    if (!sb) return;
+
+    try {
+        const record = await getBillingRecordForUser(sb, userId);
+        return res.json({
+            subscription: record,
+            access: isBillingActiveStatus(record?.status) ? 'active' : 'inactive',
+            plans: BILLING_PLANS.map((plan) => ({
+                key: plan.key,
+                label: plan.label,
+                billingCycle: plan.billingCycle,
+                amountCents: plan.amountCents,
+                currency: plan.currency,
+                displayAmount: plan.displayAmount,
+                cadenceLabel: plan.cadenceLabel,
+            })),
+        });
+    } catch (error) {
+        return res.status(500).json({ error: error.message || 'Failed to load billing state' });
+    }
+});
+
+app.post('/api/billing/checkout', async (req, res) => {
+    const userId = await requireClerkUserId(req, res);
+    if (!userId) return;
+    if (!requireXpayConfig(res)) return;
+
+    const sb = requireSupabaseAdmin(req, res);
+    if (!sb) return;
+
+    const planKey = String(req.body?.planKey || '').trim();
+    const customerEmail = String(req.body?.email || '').trim();
+    const customerName = String(req.body?.fullName || '').trim() || 'Mission Control User';
+    const phoneNumber = String(req.body?.phoneNumber || '').trim();
+    const plan = getBillingPlan(planKey);
+
+    if (!plan) {
+        return res.status(400).json({
+            error: 'Unsupported plan',
+            supportedPlans: BILLING_PLANS.map((entry) => entry.key),
+        });
+    }
+
+    if (!customerEmail) {
+        return res.status(400).json({ error: 'email is required' });
+    }
+
+    try {
+        const existing = await getBillingRecordForUser(sb, userId);
+        if (existing && isBillingActiveStatus(existing.status)) {
+            return res.json({
+                success: true,
+                alreadyActive: true,
+                subscription: existing,
+            });
+        }
+
+        const receiptId = createReceiptId(userId, plan.key);
+        const callbackUrl = `${APP_BASE_URL.replace(/\/$/, '')}/billing/callback?plan=${encodeURIComponent(plan.key)}`;
+        const cancelUrl = `${APP_BASE_URL.replace(/\/$/, '')}/pricing?status=cancelled&plan=${encodeURIComponent(plan.key)}`;
+
+        const upstream = await fetch(`${XPAY_BASE_URL.replace(/\/$/, '')}/subscription/create`, {
+            method: 'POST',
+            headers: {
+                Authorization: buildXpayAuthorizationHeader(),
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                amount: plan.amountCents,
+                currency: plan.currency,
+                receiptId,
+                customerDetails: {
+                    name: customerName,
+                    email: customerEmail,
+                    ...(phoneNumber ? { contactNumber: phoneNumber } : {}),
+                },
+                description: `Mission Control ${plan.label} (${plan.billingCycle})`,
+                callbackUrl,
+                cancelUrl,
+                interval: plan.xpayInterval,
+                intervalCount: plan.xpayIntervalCount,
+                cycleCount: plan.xpayCycleCount,
+                metadata: {
+                    userId,
+                    planKey: plan.key,
+                    billingCycle: plan.billingCycle,
+                    source: 'mission-control',
+                },
+                phoneNumberRequired: false,
+            }),
+        });
+
+        const payload = await upstream.json().catch(() => ({}));
+        if (!upstream.ok) {
+            return res.status(502).json({
+                error: payload?.errorDescription || payload?.message || 'Failed to create xPay subscription',
+                code: 'XPAY_CREATE_SUBSCRIPTION_FAILED',
+                detail: payload,
+            });
+        }
+
+        const record = {
+            userid: userId,
+            provider: 'xpay',
+            plan_key: plan.key,
+            billing_cycle: plan.billingCycle,
+            amount_cents: plan.amountCents,
+            currency: plan.currency,
+            status: 'checkout_pending',
+            xpay_subscription_id: payload?.subscriptionId || null,
+            xpay_receipt_id: receiptId,
+            checkout_url: payload?.fwdUrl || null,
+            customer_email: customerEmail,
+            customer_name: customerName,
+            last_event_type: 'checkout.created',
+            raw_last_payload: payload,
+            updated_at: new Date().toISOString(),
+        };
+
+        const { data, error } = await sb
+            .from('billing_subscriptions')
+            .upsert(record, { onConflict: 'userid' })
+            .select('*')
+            .single();
+
+        if (error) {
+            return res.status(500).json({ error: error.message || 'Failed to persist billing state' });
+        }
+
+        return res.json({
+            success: true,
+            redirectUrl: payload?.fwdUrl || null,
+            subscription: data,
+        });
+    } catch (error) {
+        return res.status(500).json({ error: error.message || 'Failed to start checkout' });
+    }
+});
+
+app.post('/api/webhooks/xpay', async (req, res) => {
+    const sb = requireSupabaseAdmin(req, res);
+    if (!sb) return;
+
+    const verification = verifyXpayWebhookSignature(req);
+    if (!verification.ok) {
+        return res.status(400).json({ error: `Invalid xPay webhook signature (${verification.reason})` });
+    }
+
+    const body = req.body || {};
+    const eventType = String(body?.eventType || body?.type || body?.event || '').trim();
+    const data = body?.data && typeof body.data === 'object' ? body.data : body;
+    const metadata = data?.metadata && typeof data.metadata === 'object' ? data.metadata : {};
+    const xpaySubscriptionId = String(
+        data?.subscriptionId
+        || data?.id
+        || body?.subscriptionId
+        || ''
+    ).trim();
+
+    let userId = String(metadata.userId || metadata.userid || '').trim();
+
+    try {
+        if (!userId && xpaySubscriptionId) {
+            const { data: existing } = await sb
+                .from('billing_subscriptions')
+                .select('*')
+                .eq('xpay_subscription_id', xpaySubscriptionId)
+                .maybeSingle();
+            userId = existing?.userid || '';
+        }
+
+        if (!userId) {
+            return res.status(202).json({ received: true, ignored: true, reason: 'user_not_resolved' });
+        }
+
+        const existing = await getBillingRecordForUser(sb, userId);
+        const nextStatus = mapXpayEventToLocalStatus(eventType, data?.status || existing?.status);
+        const now = new Date().toISOString();
+
+        const record = {
+            userid: userId,
+            provider: 'xpay',
+            plan_key: String(metadata.planKey || existing?.plan_key || '').trim() || 'starter-monthly',
+            billing_cycle: String(metadata.billingCycle || existing?.billing_cycle || '').trim() || 'monthly',
+            amount_cents: existing?.amount_cents || null,
+            currency: existing?.currency || 'USD',
+            status: nextStatus,
+            xpay_subscription_id: xpaySubscriptionId || existing?.xpay_subscription_id || null,
+            xpay_receipt_id: String(data?.receiptId || existing?.xpay_receipt_id || '').trim() || null,
+            checkout_url: existing?.checkout_url || null,
+            customer_email: String(data?.customerDetails?.email || existing?.customer_email || '').trim() || null,
+            customer_name: String(data?.customerDetails?.name || existing?.customer_name || '').trim() || null,
+            last_event_type: eventType || 'webhook.received',
+            raw_last_payload: body,
+            updated_at: now,
+            ...(isBillingActiveStatus(nextStatus) ? { activated_at: existing?.activated_at || now } : {}),
+            ...(['canceled', 'past_due'].includes(nextStatus) ? { cancelled_at: now } : {}),
+        };
+
+        const { error } = await sb
+            .from('billing_subscriptions')
+            .upsert(record, { onConflict: 'userid' });
+
+        if (error) {
+            return res.status(500).json({ error: error.message || 'Failed to persist webhook state' });
+        }
+
+        return res.json({ received: true, status: nextStatus, userId });
+    } catch (error) {
+        return res.status(500).json({ error: error.message || 'Failed to process webhook' });
+    }
 });
 
 // ── Connected apps / Composio integrations ──────────────────────────────────
@@ -654,8 +1068,9 @@ app.delete('/api/integrations/:connectedAccountId', async (req, res) => {
 
 // ── User profile sync (upsert + trigger control plane provisioning) ────────────
 app.post('/api/user/profile/sync', async (req, res) => {
-    const userId = await requireClerkUserId(req, res);
-    if (!userId) return;
+    const billingAccess = await requireActiveBillingUser(req, res);
+    if (!billingAccess) return;
+    const { userId, sb } = billingAccess;
 
     const { 
         username, 
@@ -669,9 +1084,6 @@ app.post('/api/user/profile/sync', async (req, res) => {
     if (!normalizedUsername) {
         return res.status(400).json({ error: 'username is required' });
     }
-
-    const sb = requireSupabaseAdmin(req, res);
-    if (!sb) return;
 
     try {
         // Build upsert object with new fields
