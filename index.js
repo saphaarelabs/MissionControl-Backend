@@ -32,6 +32,10 @@ const BILLING_BYPASS_EMAILS = new Set([
     'devicharanchitluri@gmail.com',
     'rukminidevichitluri9090@gmail.com',
 ].map((email) => email.toLowerCase()));
+const BILLING_BYPASS_USERNAMES = new Set([
+    'chitluridevicharan',
+    'everyain8n',
+]);
 
 // Directory where instance data is stored on the VPS (used when constructing paths).
 // Prefer environment override in hosting environments; default matches vps-agent's default.
@@ -131,10 +135,10 @@ async function requireActiveBillingUser(req, res) {
     const sb = requireSupabaseAdmin(req, res);
     if (!sb) return null;
 
-    const billingBypassEmail = normalizeEmail(req._clerkAuth?.email);
-    if (billingBypassEmail && BILLING_BYPASS_EMAILS.has(billingBypassEmail)) {
-        console.log(`[billing] bypassing subscription check for ${billingBypassEmail}`);
-        return { userId, record: null, sb, billingBypass: true, billingEmail: billingBypassEmail };
+    const billingBypass = resolveBillingBypass(req);
+    if (billingBypass.ok) {
+        console.log(`[billing] bypassing subscription check for ${billingBypass.email || billingBypass.username || userId} (reason=${billingBypass.reason})`);
+        return { userId, record: null, sb, billingBypass: true, billingEmail: billingBypass.email || null, billingUsername: billingBypass.username || null };
     }
 
     try {
@@ -366,6 +370,11 @@ function normalizeEmail(value) {
     return normalized.includes('@') ? normalized : '';
 }
 
+function normalizeUsername(value) {
+    if (!value || typeof value !== 'string') return '';
+    return value.trim().toLowerCase();
+}
+
 function extractEmailFromClerkClaims(claims) {
     if (!claims) return '';
     const candidates = [];
@@ -388,6 +397,24 @@ function extractEmailFromClerkClaims(claims) {
     }
 
     return candidates.map(normalizeEmail).find(Boolean) || '';
+}
+
+function resolveBillingBypass(req) {
+    const email = normalizeEmail(
+        req?._clerkAuth?.email
+        || req?.body?.email
+        || req?.query?.email
+    );
+    const username = normalizeUsername(req?.body?.username || req?.query?.username);
+
+    if (email && BILLING_BYPASS_EMAILS.has(email)) {
+        return { ok: true, reason: 'email', email };
+    }
+    if (username && BILLING_BYPASS_USERNAMES.has(username)) {
+        return { ok: true, reason: 'username', username, email };
+    }
+
+    return { ok: false, email, username };
 }
 
 async function requireClerkUserId(req, res) {
@@ -493,8 +520,8 @@ async function resolveUserGatewayContext(req, res, { requireProvisioned = true }
     const sb = requireSupabaseAdmin(req, res);
     if (!sb) return null;
 
-    const billingBypassEmail = normalizeEmail(req._clerkAuth?.email);
-    if (!BILLING_BYPASS_EMAILS.has(billingBypassEmail)) {
+    const billingBypass = resolveBillingBypass(req);
+    if (!billingBypass.ok) {
         try {
             const billing = await getBillingRecordForUser(sb, userId);
             if (!billing || !isBillingActiveStatus(billing.status)) {
@@ -510,7 +537,7 @@ async function resolveUserGatewayContext(req, res, { requireProvisioned = true }
             return null;
         }
     } else {
-        console.log(`[billing] bypassing gateway subscription check for ${billingBypassEmail}`);
+        console.log(`[billing] bypassing gateway subscription check for ${billingBypass.email || billingBypass.username || userId} (reason=${billingBypass.reason})`);
     }
 
     const { data, error } = await sb
@@ -1139,6 +1166,13 @@ app.post('/api/user/profile/sync', async (req, res) => {
         return res.status(400).json({ error: 'username is required' });
     }
 
+    const billingBypass = resolveBillingBypass(req);
+    const patchedOnboarding = onboardingData && typeof onboardingData === 'object' ? { ...onboardingData } : {};
+    if (billingBypass.ok && BILLING_BYPASS_USERNAMES.has(normalizeUsername(normalizedUsername))) {
+        if (!patchedOnboarding.displayName) patchedOnboarding.displayName = 'Every AI N8N';
+        if (!patchedOnboarding.workspaceName) patchedOnboarding.workspaceName = 'everyain8n';
+    }
+
     try {
         // Build upsert object with new fields
         const upsertData = {
@@ -1149,7 +1183,7 @@ app.post('/api/user/profile/sync', async (req, res) => {
         // Add optional onboarding fields if provided
         if (fullName) upsertData.full_name = fullName;
         if (phoneNumber) upsertData.phone_number = phoneNumber;
-        if (onboardingData) upsertData.onboarding_data = onboardingData;
+        if (Object.keys(patchedOnboarding).length > 0) upsertData.onboarding_data = patchedOnboarding;
 
         const { data, error } = await sb
             .from('user_profiles')
