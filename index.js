@@ -21,6 +21,7 @@ const XPAY_PUBLIC_KEY = process.env.XPAY_PUBLIC_KEY || '';
 const XPAY_PRIVATE_KEY = process.env.XPAY_PRIVATE_KEY || '';
 const XPAY_WEBHOOK_SIGNER = process.env.XPAY_WEBHOOK_SIGNER || '';
 const APP_BASE_URL = process.env.APP_BASE_URL || process.env.FRONTEND_URL || 'https://mission-control-frontend-kappa.vercel.app';
+const BILLING_ENFORCEMENT_ENABLED = ['1', 'true', 'yes', 'on'].includes(String(process.env.BILLING_ENFORCEMENT_ENABLED || '').trim().toLowerCase());
 
 // Temporary billing bypass allowlist. Remove when no longer needed.
 const BILLING_BYPASS_EMAILS = new Set([
@@ -400,6 +401,10 @@ function extractEmailFromClerkClaims(claims) {
 }
 
 function resolveBillingBypass(req) {
+    if (!BILLING_ENFORCEMENT_ENABLED) {
+        return { ok: true, reason: 'billing_enforcement_disabled', email: '', username: '' };
+    }
+
     const email = normalizeEmail(
         req?._clerkAuth?.email
         || req?.body?.email
@@ -513,14 +518,16 @@ function normalizeProviderRequestModel(provider, modelName) {
     return trimmedModel;
 }
 
-async function resolveUserGatewayContext(req, res, { requireProvisioned = true } = {}) {
+async function resolveUserGatewayContext(req, res, { requireProvisioned = true, skipBillingCheck = false } = {}) {
     const userId = await requireClerkUserId(req, res);
     if (!userId) return null;
 
     const sb = requireSupabaseAdmin(req, res);
     if (!sb) return null;
 
-    const billingBypass = resolveBillingBypass(req);
+    const billingBypass = skipBillingCheck
+        ? { ok: true, reason: 'healthcheck_skip' }
+        : resolveBillingBypass(req);
     if (!billingBypass.ok) {
         try {
             const billing = await getBillingRecordForUser(sb, userId);
@@ -694,7 +701,7 @@ app.get('/api/cors-test', (req, res) => {
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/api/health', async (req, res) => {
-    const gateway = await resolveUserGatewayContext(req, res, { requireProvisioned: false });
+    const gateway = await resolveUserGatewayContext(req, res, { requireProvisioned: false, skipBillingCheck: true });
     if (!gateway) return;
 
     try {
