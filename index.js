@@ -20,7 +20,9 @@ const XPAY_BASE_URL = process.env.XPAY_BASE_URL || 'https://api.test.xpaycheckou
 const XPAY_PUBLIC_KEY = process.env.XPAY_PUBLIC_KEY || '';
 const XPAY_PRIVATE_KEY = process.env.XPAY_PRIVATE_KEY || '';
 const XPAY_WEBHOOK_SIGNER = process.env.XPAY_WEBHOOK_SIGNER || '';
-const APP_BASE_URL = process.env.APP_BASE_URL || process.env.FRONTEND_URL || 'https://mission-control-frontend-kappa.vercel.app';
+const DEFAULT_FRONTEND_URL = 'https://magicteams-missioncontrol.netlify.app';
+const FRONTEND_URL = process.env.FRONTEND_URL || DEFAULT_FRONTEND_URL;
+const APP_BASE_URL = process.env.APP_BASE_URL || FRONTEND_URL;
 const BILLING_ENFORCEMENT_ENABLED = ['1', 'true', 'yes', 'on'].includes(String(process.env.BILLING_ENFORCEMENT_ENABLED || '').trim().toLowerCase());
 
 // Temporary billing bypass allowlist. Remove when no longer needed.
@@ -590,6 +592,7 @@ const allowedOrigins = [
     // Production deployments
     'https://openclaw-frontend.vercel.app',
     'https://mission-control-frontend-kappa.vercel.app',
+    'https://magicteams-missioncontrol.netlify.app',
     'https://mission-control-control-plane.vercel.app',
     'https://automation-1.magicteams.ai',
     'https://openclaw-api.magicteams.ai',
@@ -1786,16 +1789,16 @@ app.get('/api/providers/oauth/callback', async (req, res) => {
 
     if (error) {
         console.error(`[backend] OAuth error: ${error} - ${error_description}`);
-        return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/app/settings?oauth_error=${encodeURIComponent(error_description || error)}`);
+        return res.redirect(`${FRONTEND_URL}/app/settings?oauth_error=${encodeURIComponent(error_description || error)}`);
     }
 
     if (!code || !state) {
-        return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/app/settings?oauth_error=${encodeURIComponent('Missing code or state parameter')}`);
+        return res.redirect(`${FRONTEND_URL}/app/settings?oauth_error=${encodeURIComponent('Missing code or state parameter')}`);
     }
 
     const stateData = oauthStates.get(state);
     if (!stateData) {
-        return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/app/settings?oauth_error=${encodeURIComponent('Invalid or expired state')}`);
+        return res.redirect(`${FRONTEND_URL}/app/settings?oauth_error=${encodeURIComponent('Invalid or expired state')}`);
     }
 
     // Clean up state
@@ -1816,7 +1819,7 @@ app.get('/api/providers/oauth/callback', async (req, res) => {
                 grant_type: 'authorization_code',
                 client_id: providerConfig.clientId,
                 code: code,
-                redirect_uri: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/oauth/callback`,
+                redirect_uri: `${FRONTEND_URL}/oauth/callback`,
                 code_verifier: codeVerifier
             })
         });
@@ -1824,20 +1827,20 @@ app.get('/api/providers/oauth/callback', async (req, res) => {
         if (!tokenResponse.ok) {
             const errorData = await tokenResponse.text();
             console.error(`[backend] Token exchange failed:`, errorData);
-            return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/app/settings?oauth_error=${encodeURIComponent('Token exchange failed')}`);
+            return res.redirect(`${FRONTEND_URL}/app/settings?oauth_error=${encodeURIComponent('Token exchange failed')}`);
         }
 
         const tokenData = await tokenResponse.json();
         const accessToken = tokenData.access_token;
 
         if (!accessToken) {
-            return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/app/settings?oauth_error=${encodeURIComponent('No access token received')}`);
+            return res.redirect(`${FRONTEND_URL}/app/settings?oauth_error=${encodeURIComponent('No access token received')}`);
         }
 
         // Store token via VPS agent using the stored user token
         const ctx = await resolveVpsAgentContext({ headers: { authorization: `Bearer ${userToken}` } }, null, userId);
         if (!ctx) {
-            return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/app/settings?oauth_error=${encodeURIComponent('Failed to resolve user context')}`);
+            return res.redirect(`${FRONTEND_URL}/app/settings?oauth_error=${encodeURIComponent('Failed to resolve user context')}`);
         }
 
         const { ok, status, data } = await callVpsAgent(ctx.agentBaseUrl, '/api/internal/configure-provider', {
@@ -1850,15 +1853,15 @@ app.get('/api/providers/oauth/callback', async (req, res) => {
 
         if (!ok) {
             console.error(`[backend] Failed to configure OAuth provider:`, data);
-            return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/app/settings?oauth_error=${encodeURIComponent('Failed to save OAuth token')}`);
+            return res.redirect(`${FRONTEND_URL}/app/settings?oauth_error=${encodeURIComponent('Failed to save OAuth token')}`);
         }
 
         // Redirect back to settings with success
-        res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/app/settings?oauth_success=${encodeURIComponent(provider)}`);
+        res.redirect(`${FRONTEND_URL}/app/settings?oauth_success=${encodeURIComponent(provider)}`);
 
     } catch (error) {
         console.error(`[backend] OAuth callback error:`, error);
-        res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/app/settings?oauth_error=${encodeURIComponent('OAuth flow failed')}`);
+        res.redirect(`${FRONTEND_URL}/app/settings?oauth_error=${encodeURIComponent('OAuth flow failed')}`);
     }
 });
 
